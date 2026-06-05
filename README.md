@@ -1,12 +1,12 @@
 # LeRobot ROS 2 Integration
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-![Repo size](https://img.shields.io/github/repo-size/ABC-iRobotics/lerobot_ros)
-![Repo stars](https://img.shields.io/github/stars/ABC-iRobotics/lerobot_ros)
-![Repo forks](https://img.shields.io/github/forks/ABC-iRobotics/lerobot_ros)
+![Repo size](https://img.shields.io/github/repo-size/ABC-iRobotics/irob_lerobot_ros)
+![Repo stars](https://img.shields.io/github/stars/ABC-iRobotics/irob_lerobot_ros)
+![Repo forks](https://img.shields.io/github/forks/ABC-iRobotics/irob_lerobot_ros)
 
 ## Introduction
-The `lerobot_ros` package provides a seamless ROS 2 integration for Hugging Face's LeRobot framework. It acts as a bridge, allowing users to control ROS 2-enabled robotic arms and cameras directly through the standard LeRobot interface.
+The `irob_lerobot_ros` package provides a seamless ROS 2 integration for Hugging Face's LeRobot framework. It acts as a bridge, allowing users to control ROS 2-enabled robotic arms and cameras directly through the standard LeRobot interface.
 
 The package implements the `ROS2Robot` and `ROS2Camera` classes, which wrap standard ROS 2 publishers, subscribers, MoveIt 2, and MoveIt Servo interfaces to be fully compatible with LeRobot's dataset collection and policy execution pipelines.
 
@@ -31,12 +31,12 @@ Using the previous section's links, install every prerequisites.
 
 Navigate into your ROS 2 workspace and copy this repo to your source folder:
 ```bash
-cd src && git clone https://github.com/ABC-iRobotics/lerobot_ros.git && cd ..
+cd src && git clone https://github.com/ABC-iRobotics/irob_lerobot_ros.git && cd ..
 ```
 
 Build the package:
 ```bash
-colcon build --packages-select lerobot_ros
+colcon build --packages-select irob_lerobot_ros
 ```
 
 ## Usage
@@ -44,8 +44,8 @@ colcon build --packages-select lerobot_ros
 After installation, you can initialize a `ROS2Robot` object in your Python scripts using the `ROS2RobotConfig`.
 
 ```python
-from lerobot_ros.config import FR3RobotConfig, ROS2CameraConfig, ActionType
-from lerobot_ros.ros2robot import ROS2Robot
+from irob_lerobot_ros.config import FR3RobotConfig, ROS2CameraConfig, ActionType
+from irob_lerobot_ros.ros2robot import ROS2Robot
 
 # Configure the robot
 config = FR3RobotConfig(
@@ -81,7 +81,7 @@ In case of any issues, check the official resources:
 
 ## Contributing
 
-Contributions to the `lerobot_ros` package are highly appreciated! If you would like to help improve the package or integrate new features, please take a look at our [TODO.md](./TODO.md) file, which lists the currently known issues and areas needing development.
+Contributions to the `irob_lerobot_ros` package are highly appreciated! If you would like to help improve the package or integrate new features, please take a look at our [TODO.md](./TODO.md) file, which lists the currently known issues and areas needing development.
 
 ## Author
 
