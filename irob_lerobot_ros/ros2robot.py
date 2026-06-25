@@ -4,6 +4,9 @@ from functools import wraps
 from threading import Thread
 from typing import Optional
 
+
+
+
 from lerobot.cameras.camera import Camera
 from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.robots import Robot
@@ -377,105 +380,118 @@ class ROS2Robot(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError("Robot is not connected.")
             
+        action_executed = False
+        
+        # 1. Arm Action Execution
         if self.config.arm_action_type in [ActionType.JOINT_POSITION, ActionType.JOINT_TRAJECTORY]:
-            arm_goal_pos = {k.removesuffix('.pos'): v for k, v in action.items() if k.endswith('.pos') and k.removesuffix('.pos') in self.config.arm_joint_names + self.config.gripper_joint_names}
-            
-            if self.directly_publish and arm_goal_pos:
-                joint_command_msg = JointState()
-                joint_command_msg.header = Header()
-                joint_command_msg.header.stamp = self.node.get_clock().now().to_msg()
-                joint_command_msg.header.frame_id = self.config.frame_id
-                joint_command_msg.name = list(arm_goal_pos.keys())
-                joint_command_msg.position = list(arm_goal_pos.values())
-                self.joint_command_pub.publish(joint_command_msg)
-                return
-            
-            if self.config.arm_action_type == ActionType.JOINT_POSITION and arm_goal_pos:
-                success = self._moveit2.move_to_configuration([arm_goal_pos[joint] for joint in self.config.arm_joint_names])
+            if isinstance(action, dict):
+                arm_goal_pos = {k.removesuffix('.pos'): v for k, v in action.items() if k.endswith('.pos') and k.removesuffix('.pos') in self.config.arm_joint_names}
+                
+                if self.directly_publish and arm_goal_pos:
+                    joint_command_msg = JointState()
+                    joint_command_msg.header = Header()
+                    joint_command_msg.header.stamp = self.node.get_clock().now().to_msg()
+                    joint_command_msg.header.frame_id = self.config.frame_id
+                    joint_command_msg.name = list(arm_goal_pos.keys())
+                    joint_command_msg.position = list(arm_goal_pos.values())
+                    self.joint_command_pub.publish(joint_command_msg)
+                    action_executed = True
+                
+                elif self.config.arm_action_type == ActionType.JOINT_POSITION and arm_goal_pos:
+                    if all(joint in arm_goal_pos for joint in self.config.arm_joint_names):
+                        success = self._moveit2.move_to_configuration([arm_goal_pos[joint] for joint in self.config.arm_joint_names])
+                        if not success:
+                            self.node.get_logger().error("Failed to move to joint configuration.")
+                            if self.config.fallback_planner_id:
+                                self.node.get_logger().info("Trying fallback planner.")
+                                self._moveit2.planner_id = self.config.fallback_planner_id
+                                success = self._moveit2.move_to_configuration([arm_goal_pos[joint] for joint in self.config.arm_joint_names])
+                                if not success:
+                                    self.node.get_logger().error("Failed to move to joint configuration with fallback planner.")
+                                else:
+                                    self.node.get_logger().info("Successfully moved to joint configuration with fallback planner.")
+                                    action_executed = True
+                                self._moveit2.planner_id = self.config.planner_id
+                        else:
+                            action_executed = True
+                            
+                        if action_executed and wait_for_execution:
+                            self._moveit2.wait_until_executed()
+                    else:
+                        self.node.get_logger().warn("Incomplete arm joint configuration provided in action.")
+                
+                elif self.config.arm_action_type == ActionType.JOINT_TRAJECTORY and arm_goal_pos:
+                    self.node.get_logger().warn("JOINT_TRAJECTORY action type is not yet implemented.")
+                    
+        elif self.config.arm_action_type == ActionType.CARTESIAN_POSE:
+            if isinstance(action, Pose):
+                pose_stamped = PoseStamped()
+                pose_stamped.header = Header()
+                pose_stamped.header.stamp = self.node.get_clock().now().to_msg()
+                pose_stamped.header.frame_id = self.config.frame_id
+                pose_stamped.pose = action
+                success = self._moveit2.move_to_pose(
+                    pose=pose_stamped,
+                    cartesian=cartesian,
+                    start_joint_state=self.joint_state
+                )
                 if not success:
-                    self.node.get_logger().error("Failed to move to joint configuration.")
+                    self.node.get_logger().error("Failed to move to Cartesian pose.")
                     if self.config.fallback_planner_id:
                         self.node.get_logger().info("Trying fallback planner.")
                         self._moveit2.planner_id = self.config.fallback_planner_id
-                        success = self._moveit2.move_to_configuration([arm_goal_pos[joint] for joint in self.config.arm_joint_names])
+                        success = self._moveit2.move_to_pose(
+                            pose=pose_stamped,
+                            cartesian=cartesian,
+                            start_joint_state=self.joint_state
+                        )
                         if not success:
-                            self.node.get_logger().error("Failed to move to joint configuration with fallback planner.")
-                            return False
-                        self.node.get_logger().info("Successfully moved to joint configuration with fallback planner.")
+                            self.node.get_logger().error("Failed to move to Cartesian pose with fallback planner.")
+                        else:
+                            self.node.get_logger().info("Successfully moved to Cartesian pose with fallback planner.")
+                            action_executed = True
                         self._moveit2.planner_id = self.config.planner_id
-                    else:
-                        return False
-                if wait_for_execution:
-                    return self._moveit2.wait_until_executed()
-                
-            if self.config.arm_action_type == ActionType.JOINT_TRAJECTORY and arm_goal_pos:
-                self.node.get_logger().warn("JOINT_TRAJECTORY action type is not yet implemented, defaulting to JOINT_POSITION control for this action.")
-                if arm_goal_pos is None:
-                    return
-                
-        if self.config.arm_action_type == ActionType.CARTESIAN_POSE:
-            if not isinstance(action, Pose):
-                self.node.get_logger().error("Invalid action type for CARTESIAN_POSE action.")
-                return
-                
-            pose_stamped = PoseStamped()
-            pose_stamped.header = Header()
-            pose_stamped.header.stamp = self.node.get_clock().now().to_msg()
-            pose_stamped.header.frame_id = self.config.frame_id
-            pose_stamped.pose = action
-            success = self._moveit2.move_to_pose(
-                pose=pose_stamped,
-                cartesian=cartesian,
-                start_joint_state=self.joint_state
-            )
-            if not success:
-                self.node.get_logger().error("Failed to move to Cartesian pose.")
-                if self.config.fallback_planner_id:
-                    self.node.get_logger().info("Trying fallback planner.")
-                    self._moveit2.planner_id = self.config.fallback_planner_id
-                    success = self._moveit2.move_to_pose(
-                        pose=pose_stamped,
-                        cartesian=cartesian,
-                        start_joint_state=self.joint_state
-                    )
-                    if not success:
-                        self.node.get_logger().error("Failed to move to Cartesian pose with fallback planner.")
-                        return False
-                    self.node.get_logger().info("Successfully moved to Cartesian pose with fallback planner.")
-                    self._moveit2.planner_id = self.config.planner_id
                 else:
-                    return False
-            if wait_for_execution:
-                return self._moveit2.wait_until_executed()
-        
-        if self.config.arm_action_type == ActionType.CARTESIAN_VELOCITY:
-            if not isinstance(action, Twist):
-                self.node.get_logger().error("Invalid action type for CARTESIAN_VELOCITY action.")
-                return
-            self._servo_interface.servo(
-                linear=[action.linear.x, action.linear.y, action.linear.z],
-                angular=[action.angular.x, action.angular.y, action.angular.z]
-            )
-            return True # TODO: Add error handling for servo command execution and return False if execution fails
-            
+                    action_executed = True
+                    
+                if action_executed and wait_for_execution:
+                    self._moveit2.wait_until_executed()
+            elif isinstance(action, dict):
+                arm_keys = [k for k in action.keys() if k.removesuffix('.pos') in self.config.arm_joint_names]
+                if arm_keys:
+                    self.node.get_logger().error("Invalid action type for CARTESIAN_POSE arm action. Expected Pose object.")
+                    
+        elif self.config.arm_action_type == ActionType.CARTESIAN_VELOCITY:
+            if isinstance(action, Twist):
+                self._servo_interface.servo(
+                    linear=[action.linear.x, action.linear.y, action.linear.z],
+                    angular=[action.angular.x, action.angular.y, action.angular.z]
+                )
+                action_executed = True
+            elif isinstance(action, dict):
+                arm_keys = [k for k in action.keys() if k.removesuffix('.pos') in self.config.arm_joint_names]
+                if arm_keys:
+                    self.node.get_logger().error("Invalid action type for CARTESIAN_VELOCITY arm action. Expected Twist object.")
+
+        # 2. Gripper Action Execution
         if self.config.gripper_action_type == ActionType.JOINT_POSITION:
-            gripper_goal_pos = {
-                k.removesuffix('.pos'): v 
-                for k, v in action.items() 
-                if k.endswith('.pos') and k.removesuffix('.pos') in self.config.gripper_joint_names
-            }
-            gripper_goal_pos = list(gripper_goal_pos.values())
-            if gripper_goal_pos:
-                if len(gripper_goal_pos) == 1:
-                    self._gripper_interface.move_to_position(gripper_goal_pos[0])
-                    if wait_for_execution:
-                        self._gripper_interface.wait_until_executed()
-                    return True # TODO: Add error handling for gripper action execution and return False if execution fails
-                else:
-                    self.node.get_logger().warn(f'Received gripper action with {gripper_goal_pos} joints, but only single-joint control is currently supported.    ')
-                    self.node.get_logger().warn("Currently only single-joint gripper control is supported.")
+            if isinstance(action, dict):
+                gripper_goal_pos = {
+                    k.removesuffix('.pos'): v 
+                    for k, v in action.items() 
+                    if k.endswith('.pos') and k.removesuffix('.pos') in self.config.gripper_joint_names
+                }
+                gripper_goal_vals = list(gripper_goal_pos.values())
+                if gripper_goal_vals:
+                    if len(gripper_goal_vals) == 1:
+                        self._gripper_interface.move_to_position(gripper_goal_vals[0])
+                        action_executed = True
+                        if wait_for_execution:
+                            self._gripper_interface.wait_until_executed()
+                    else:
+                        self.node.get_logger().warn(f"Received gripper action with {len(gripper_goal_vals)} joints, but only single-joint control is currently supported.")
         
-        return False  # Return False if action type is not recognized or if required keys are missing
+        return action_executed
 
     def disconnect(self):
         for cam in self.cameras.values():

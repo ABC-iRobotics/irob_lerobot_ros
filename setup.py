@@ -15,7 +15,13 @@ setup(
     ] + [
         (os.path.join('share', package_name, os.path.dirname(f)), [f])
         for f in glob(os.path.join(package_name, '**', '*'), recursive=True) if os.path.isfile(f)
-    ],
+    ] + [
+        (os.path.join('share', package_name, os.path.dirname(f)), [f])
+        for f in glob(os.path.join('modules', '**', '*'), recursive=True) if os.path.isfile(f)
+    ]
+    
+    
+    ,
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='Andras Makany',
