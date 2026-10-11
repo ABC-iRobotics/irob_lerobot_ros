@@ -23,6 +23,12 @@ class ROS2CameraConfig(CameraConfig):
     namespace: str = ""
     topic: str = "/camera/image_raw"
     frame_id: str = "camera_link"
+    # Read the camera's depth stream (<topic>/depth) instead of its colour one. One
+    # ROS2Camera per stream: a camera publishing both is two configs on one `topic`,
+    # because lerobot keys one dataset feature per Camera. The rgb wire format is NOT
+    # configured here -- ROS2Camera asks the graph whether the publisher is raw or
+    # H.264 (see _discover_rgb_stream).
+    depth: bool = False
 
 @dataclass
 class ROS2RobotConfig(RobotConfig):
@@ -141,4 +147,3 @@ class FR3RobotConfig(ROS2RobotConfig):
     
     gripper_group_name: str = "franka_gripper"
     gripper_command_action_name: str = "franka_gripper/gripper_cmd"
-    

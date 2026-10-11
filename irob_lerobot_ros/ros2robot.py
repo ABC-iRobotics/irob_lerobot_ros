@@ -1,7 +1,7 @@
 import time
 from functools import cached_property
 from functools import wraps
-from threading import Thread
+from threading import Event, Thread
 from typing import Optional
 
 
@@ -416,7 +416,14 @@ class ROS2Robot(Robot):
                             action_executed = True
                             
                         if action_executed and wait_for_execution:
-                            self._moveit2.wait_until_executed()
+                            # See the CARTESIAN_POSE branch: propagate the execution
+                            # result so a STATUS_ABORTED trajectory counts as failure.
+                            action_executed = bool(self._moveit2.wait_until_executed())
+                            if not action_executed:
+                                self.node.get_logger().error(
+                                    "Joint move aborted; MoveIt execution error_code="
+                                    f"{self._moveit2.get_last_execution_error_code()}"
+                                )
                     else:
                         self.node.get_logger().warn("Incomplete arm joint configuration provided in action.")
                 
@@ -455,7 +462,16 @@ class ROS2Robot(Robot):
                     action_executed = True
                     
                 if action_executed and wait_for_execution:
-                    self._moveit2.wait_until_executed()
+                    # Fold the execution result in: wait_until_executed() returns
+                    # False on STATUS_ABORTED. Discarding it made an aborted move
+                    # (e.g. the retreat) look successful, so the arm continued into
+                    # the bin at grasp height. Now an aborted trajectory is a failure.
+                    action_executed = bool(self._moveit2.wait_until_executed())
+                    if not action_executed:
+                        self.node.get_logger().error(
+                            "Cartesian move aborted; MoveIt execution error_code="
+                            f"{self._moveit2.get_last_execution_error_code()}"
+                        )
             elif isinstance(action, dict):
                 arm_keys = [k for k in action.keys() if k.removesuffix('.pos') in self.config.arm_joint_names]
                 if arm_keys:
@@ -484,7 +500,9 @@ class ROS2Robot(Robot):
                 gripper_goal_vals = list(gripper_goal_pos.values())
                 if gripper_goal_vals:
                     if len(gripper_goal_vals) == 1:
-                        self._gripper_interface.move_to_position(gripper_goal_vals[0])
+                        self._gripper_interface.move_to_position(
+                            gripper_goal_vals[0], start_joint_state=self.joint_state
+                        )
                         action_executed = True
                         if wait_for_execution:
                             self._gripper_interface.wait_until_executed()
@@ -517,15 +535,41 @@ class ROS2Robot(Robot):
         rate.sleep()
         rate.destroy()
 
-    @executor_safe
-    def callService(self, service: Client, request, message: str | None = None):
+    def callService(
+        self,
+        service: Client,
+        request,
+        message: str | None = None,
+        timeout_sec: float = 60.0,
+        retries: int = 1,
+    ):
         if isinstance(message, str):
             self.node.get_logger().info(message)
         self.node.get_logger().info(f"Calling {service.srv_name} service.")
-        
-        response = service.call_async(request)
-        rclpy.spin_until_future_complete(self.node, response)
-        response = response.result()
-        
-        self.node.get_logger().info(f"Called {service.srv_name} successfully.")
-        return response
+
+        # The node is spun continuously by the background MultiThreadedExecutor
+        # (_ros_thread) and the clients live in a ReentrantCallbackGroup, so we wait
+        # on the async future from this worker thread instead of spinning a second
+        # executor. That removes the nested-service deadlock (spinning a node that is
+        # already being spun) the old @executor_safe juggling worked around, and the
+        # timeout means a single dropped/late reply cannot wedge the whole run.
+        last_error: Exception = TimeoutError(f"Service '{service.srv_name}' never responded.")
+        for attempt in range(retries + 1):
+            future = service.call_async(request)
+            done = Event()
+            future.add_done_callback(lambda _f: done.set())  # fires immediately if already done
+
+            if done.wait(timeout_sec):
+                self.node.get_logger().info(f"Called {service.srv_name} successfully.")
+                return future.result()
+
+            last_error = TimeoutError(
+                f"Service '{service.srv_name}' timed out after {timeout_sec}s"
+            )
+            self.node.get_logger().warn(f"{last_error} (attempt {attempt + 1}/{retries + 1}).")
+            try:
+                service.remove_pending_request(future)  # avoid leaking the pending request
+            except Exception:
+                pass
+
+        raise last_error

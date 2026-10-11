@@ -11,7 +11,10 @@
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
-  <depend>cv_bridge</depend>
+  <!-- ros2robot.py imports pymoveit2 at module level, so every consumer of this
+       package needs it built; without the dependency a "packages up to guide"
+       colcon build silently leaves it out. -->
+  <exec_depend>pymoveit2</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
