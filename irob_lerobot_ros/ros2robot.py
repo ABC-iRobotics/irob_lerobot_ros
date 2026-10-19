@@ -29,6 +29,7 @@ from rclpy.node import Subscription
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.task import Future
+from rclpy.duration import Duration
 
 from sensor_msgs.msg import JointState
 
@@ -236,7 +237,6 @@ class ROS2Robot(Robot):
             gripper_ft = {f'{self.config.gripper_joint_names[i]}.vel': float for i in range(len(self.config.gripper_joint_names))}
         if self.config.gripper_observation_type == ObservationType.JOINT_EFFORT:
             gripper_ft = {f'{self.config.gripper_joint_names[i]}.effort': float for i in range(len(self.config.gripper_joint_names))}
-        return {**arm_ft}
         return {**arm_ft, **gripper_ft}
         
     @property
@@ -376,9 +376,16 @@ class ROS2Robot(Robot):
         
             
 
-    def send_action(self, action: Pose | Twist | dict[str, float], cartesian=False, wait_for_execution=False) -> bool:
+    def send_action(self, action: Pose | Twist | dict[str, float], cartesian=False, wait_for_execution=False,
+                    speed: float | None = None, min_fraction: float = 0.0) -> bool:
+        """speed: GUIDE-EX's speed, 0 to 1: MoveIt's velocity scaling (None keeps the current one), or
+        controller: oscbf's cruise speed, speed x 0.5 m/s (None = 1.0). min_fraction: MoveIt's; a
+        Cartesian path MoveIt can compute for less than this share of the way is refused before the
+        arm moves (controller: oscbf plans straight lines or refuses)."""
         if not self.is_connected:
             raise DeviceNotConnectedError("Robot is not connected.")
+        if speed is not None and self._moveit2 is not None:
+            self._moveit2.max_velocity = speed
             
         action_executed = False
         
@@ -431,6 +438,18 @@ class ROS2Robot(Robot):
                     self.node.get_logger().warn("JOINT_TRAJECTORY action type is not yet implemented.")
                     
         elif self.config.arm_action_type == ActionType.CARTESIAN_POSE:
+            # MoveIt executes whatever part of a Cartesian path it could compute and reports success
+            # (pymoveit2's threshold defaults to 0): stopping short of a cube, or at the edge of a
+            # self-collision no later plan can start from. Ask for the path first.
+            if isinstance(action, Pose) and cartesian and min_fraction > 0 and self._moveit2.plan(
+                pose=action,
+                frame_id=self.config.frame_id,
+                cartesian=True,
+                cartesian_fraction_threshold=min_fraction,
+                start_joint_state=self.joint_state,
+            ) is None:
+                self.node.get_logger().warning(f"No straight path (< {min_fraction:.0%}) to the pose; not executed.")
+                return False
             if isinstance(action, Pose):
                 pose_stamped = PoseStamped()
                 pose_stamped.header = Header()
@@ -530,10 +549,22 @@ class ROS2Robot(Robot):
         self._gripper_interface = None
         self._servo_interface = None
 
-    def sleep(self, seconds: float):
-        rate = self.node.create_timer(seconds)
-        rate.sleep()
-        rate.destroy()
+    def sleep(self, seconds: float, stall_timeout: float = 30.0) -> None:
+        """Block for `seconds` of the node's clock: SIM time under use_sim_time.
+
+        GUIDE-EX's waits use it, so a wait lasts the same simulated time at any RTF. Raises
+        when the clock stops advancing for `stall_timeout` s of wall time (a dead simulator).
+        """
+        clock = self.node.get_clock()
+        last = clock.now()
+        end = last + Duration(seconds=seconds)
+        wall = time.perf_counter()
+        while (now := clock.now()) < end:
+            if now != last:
+                last, wall = now, time.perf_counter()
+            elif time.perf_counter() - wall > stall_timeout:
+                raise TimeoutError(f"The clock did not advance for {stall_timeout} s of wall time; is the simulation running?")
+            time.sleep(0.002)
 
     def callService(
         self,

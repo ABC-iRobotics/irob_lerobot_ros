@@ -40,6 +40,11 @@ class ROS2RobotConfig(RobotConfig):
     gripper_observation_type: ObservationType = ObservationType.JOINT_POSITION
     
     frame_id: str = "base_link"
+
+    # Motion layer: "moveit" (pymoveit2 + move_group) or "oscbf" (S2b: guide_motion's planner,
+    # MotionTargets at 20 Hz to the OSCBF controller in the simulator's or robot's control loop).
+    controller: str = "moveit"
+    motion_robot: str = ""  # guide_motion robot description for controller: oscbf ("fr3", "panda")
     
     # MoveIt2 specific configurations
     arm_joint_names: List[str] = field(
@@ -122,6 +127,7 @@ class FR3RobotConfig(ROS2RobotConfig):
     planner_id: str = "RRTConnectkConfigDefault"
 
     directly_publish: bool = False
+    motion_robot: str = "fr3"
     
     max_joint_positions: List[float] = field(
         default_factory=lambda: [2.9007, 1.8361, 2.9007, -0.1169, 2.8763, 4.6216, 3.0508]
