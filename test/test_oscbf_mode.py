@@ -239,7 +239,7 @@ def test_twist_is_queued_without_waiting(make):
 def test_a_clock_restart_during_a_wait_still_times_out(make):
     from guide_motion.targets import Target
 
-    r = make(clock=RestartingClock())
+    r = make(clock=RestartingClock(start=20.0))  # 20 s in, back to 0: without the resync the wait lasts ~20 s
     p, R = r._motion.ee_pose(HOME)
     started = time.perf_counter()
     assert not r._wait_reached(Target(position=p + [0.1, 0, 0], rotation=R), timeout=0.2)
@@ -304,6 +304,8 @@ def test_reset_waits_on_sim_time_for_the_home_configuration(make):
     assert 3.4e9 <= r.node.get_clock().t <= 3.45e9  # timeout 2 s + 2 x 14 homing targets x 50 ms, sim time
     r.joint_state.position = list(HOME)  # the host has homed it
     assert r.reset_scene("/Sim_0/Reset", "request", HOME)
+    r.joint_state.position = list(away)  # a scene whose default_joint_states is `away`, not the XRDF default
+    assert r.reset_scene("/Sim_0/Reset", "request", away)
 
 
 def test_oscbf_never_reaches_into_moveit(make):
@@ -346,4 +348,86 @@ def test_reset_to_a_home_outside_the_limits_returns_false_and_keeps_the_stream(m
     home = list(HOME)
     home[0] = 10.0  # rad: beyond fr3_joint1's limit
     assert not r.reset_scene("/Sim_0/Reset", "request", home)
-    assert any("planner" in str(line) for line in r.logs) and len(r._queue) == queued
+    assert any("PlanningError" in str(line) for line in r.logs) and len(r._queue) == queued
+
+
+def test_a_pose_move_waits_on_sim_time_and_holds_off_when_it_times_out(make):
+    """Review C2 I2b + M3: wait_for_execution=True waits 2 s + 2 x the plan (15 targets: 3.5 s of sim
+    time); False then means stopped: the failed goal is no longer streamed."""
+    r = make(clock=FakeClock(step=0.01))
+    p, R = r._motion.ee_pose(HOME)
+    assert not r.send_action(pose(p + [0.0, 0.0, -0.1], R), wait_for_execution=True)  # the arm never moves
+    assert 3.5e9 <= r.node.get_clock().t <= 3.55e9
+    assert not r._queue and r._last is None
+
+
+def test_a_refused_arm_goal_leaves_the_gripper_alone(make):
+    """Review C2 M1: the arm goal is checked and planned before the gripper is commanded."""
+    r = make()
+    joints = {f"{j}.pos": v for j, v in zip(ARM, HOME)}
+    assert not r.send_action({"fr3_joint1.pos": 0.0, "fr3_finger_joint1.pos": 0.04})  # partial arm goal
+    assert not r.send_action({**joints, "fr3_joint1.pos": 10.0, "fr3_finger_joint1.pos": 0.04})  # beyond the limits
+    assert np.isnan(r._width) and r._last is None and not r._queue
+    assert r.send_action({**joints, "fr3_finger_joint1.pos": 0.04})
+    assert r._width == pytest.approx(0.08) and r._queue
+
+
+def test_failures_return_false_instead_of_raising(make):
+    """Review C2 I1/M2, spec 8: send_action and reset_scene answer False with a log line, never raise."""
+    r = make()
+    p, R = r._motion.ee_pose(HOME)
+    zero = pose(p, R)
+    zero.orientation.x = zero.orientation.y = zero.orientation.z = zero.orientation.w = 0.0
+    assert not r.send_action(zero)  # scipy: ValueError, zero quaternion
+    assert not r.send_action(pose(p, R), speed=0.0)  # plan(): ValueError, speed must be > 0
+    assert not r.send_action(pose(p + [np.nan, 0.0, 0.0], R))  # plan(): PlanningError, non-finite goal
+
+    def silent(service, request, message=None):
+        raise TimeoutError("Service '/Sim_0/Reset' timed out after 60.0s")
+
+    r.callService = silent
+    assert not r.reset_scene("/Sim_0/Reset", "request", HOME)
+    assert [type_ for type_ in ("ValueError", "ValueError", "PlanningError", "TimeoutError")] == [
+        next(t for t in ("ValueError", "PlanningError", "TimeoutError") if t in str(line)) for line in r.logs]
+
+
+class FrameClock(FakeClock):
+    """Advances like FakeClock but reads in whole frames, as /clock does with one message per rendered frame."""
+
+    def __init__(self, step=0.004, frame=0.02):
+        super().__init__(step)
+        self.frame = int(frame * 1e9)
+
+    def now(self):
+        t = super().now().nanoseconds
+        return Time(nanoseconds=t - t % self.frame)
+
+
+def test_the_stream_keeps_20_hz_when_frames_do_not_divide_50_ms(make):
+    """Review C2 M5: at step_freq 50 (20 ms frames) a period must not stretch to 60 ms."""
+    from guide_motion.targets import Target
+
+    clock = FrameClock()
+    r = make(clock=clock)
+    sent = []
+    r._motion_target_msg = lambda target, width: clock.t
+    r._motion_pub = SimpleNamespace(publish=sent.append)
+    r._stop_stream = threading.Event()
+    r._last = Target()
+    thread = threading.Thread(target=r._stream, daemon=True)
+    thread.start()
+    while clock.t < 2.1e9:
+        time.sleep(0.01)
+    r._stop_stream.set()
+    thread.join()
+    assert 39 <= sum(t < 2.0e9 for t in sent) <= 41  # 20 Hz over 2 s of sim time
+
+
+def test_a_stalled_clock_says_so(make):
+    """Review C2 M8: a stopped simulator is not a timeout on sim time."""
+    from guide_motion.targets import Target
+
+    r = make(clock=FakeClock(step=0.0))
+    p, R = r._motion.ee_pose(HOME)
+    assert not r._wait_reached(Target(position=p + [0.1, 0, 0], rotation=R), timeout=1.0, stall_timeout=0.05)
+    assert "did not advance" in str(r.logs[-1])

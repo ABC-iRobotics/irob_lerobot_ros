@@ -47,6 +47,15 @@ from geometry_msgs.msg import Twist
 MOTION_DT = 0.05  # MotionTarget period, s of sim time (20 Hz, S2b; guide_motion.planner.DT)
 
 
+def _oscbf_failures():
+    """What controller: oscbf answers with False and a log line, never a raise (spec 8). Imported
+    here, not at the top: MoveIt mode never loads guide_motion."""
+    from guide_motion.planner import PlanningError
+    from pink.exceptions import NoSolutionFound
+
+    return PlanningError, NoSolutionFound, ValueError, TimeoutError
+
+
 def executor_safe(f):
     import rclpy
     from functools import wraps
@@ -391,7 +400,11 @@ class ROS2Robot(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError("Robot is not connected.")
         if self.config.controller == "oscbf":
-            return self._send_oscbf(action, wait_for_execution, speed)
+            try:
+                return self._send_oscbf(action, wait_for_execution, speed)
+            except _oscbf_failures() as error:
+                self.node.get_logger().error(f"guide_motion planner refused the action: {type(error).__name__}: {error}")
+                return False
         if speed is not None and self._moveit2 is not None:
             self._moveit2.max_velocity = speed
             
@@ -645,13 +658,15 @@ class ROS2Robot(Robot):
         again, so the controller never goes stale while it holds a goal."""
         from guide_motion.targets import TWIST
 
-        clock = self.node.get_clock()
-        due = clock.now()
+        clock, period = self.node.get_clock(), int(MOTION_DT * 1e9)
+        due = clock.now().nanoseconds
         while not self._stop_stream.wait(0.002):  # poll the clock every 2 ms of wall time
-            now = clock.now()
-            if now < due and (due - now).nanoseconds < 1e9:  # a clock > 1 s behind restarted: send now
+            now = clock.now().nanoseconds
+            if not due - period <= now < due + period:  # the clock restarted, or ran a period past due: re-anchor
+                due = now
+            if now < due:
                 continue
-            due = now + Duration(seconds=MOTION_DT)
+            due += period  # from the last due, not from now: 20 Hz whatever the frame length divides
             with self._queue_lock:
                 if self._queue:
                     self._last = self._queue.popleft()
@@ -676,10 +691,10 @@ class ROS2Robot(Robot):
         return msg
 
     def _send_oscbf(self, action, wait_for_execution: bool, speed: float | None) -> bool:
-        from guide_motion.planner import PlanningError, plan
+        from guide_motion.planner import plan
         from guide_motion.targets import JOINTS, TWIST, Target
 
-        names = list(self.config.arm_joint_names)
+        names, fingers, goal = list(self.config.arm_joint_names), [], None
         if isinstance(action, Pose):
             # Ruling 4: poses arrive in the robot's base frame; GUIDE converts, the solver looks nothing up
             if self.config.frame_id != self._motion.base_link:
@@ -694,29 +709,27 @@ class ROS2Robot(Robot):
         elif isinstance(action, dict):
             fingers = [v for k, v in action.items() if k.removesuffix(".pos") in self.config.gripper_joint_names]
             arm = {k.removesuffix(".pos"): v for k, v in action.items() if k.removesuffix(".pos") in names}
-            if fingers:
-                with self._queue_lock:
-                    self._width = 2.0 * float(fingers[0])  # one finger's travel -> opening width
-                    if self._last is None and not self._queue:  # nothing streams yet: hold here so the width goes out
-                        position, rotation = self._motion.ee_pose(self._arm_state()[0])
-                        self._last = Target(position=position, rotation=rotation)
             if arm and len(arm) != len(names):
                 self.node.get_logger().warn("Incomplete arm joint configuration provided in action.")
                 return False
-            if not arm:
-                return bool(fingers)
-            goal = Target(mode=JOINTS, joints=np.array([arm[j] for j in names], float))
+            if arm:
+                goal = Target(mode=JOINTS, joints=np.array([arm[j] for j in names], float))
+            elif not fingers:
+                return False
         else:
             return False
-        try:
-            # Ruling 3: GUIDE-EX's speed sets the cruise speed, speed x 0.5 m/s; None = 1.0
-            targets = plan(self._motion, goal, self._arm_state()[0], speed=1.0 if speed is None else speed)
-        except PlanningError as error:
-            self.node.get_logger().error(f"guide_motion planner: {error}")
-            return False
-        with self._queue_lock:
-            self._queue = deque(targets)
-        if not wait_for_execution or goal.mode == TWIST:
+        q = self._arm_state()[0]
+        # Ruling 3: GUIDE-EX's speed sets the cruise speed, speed x 0.5 m/s; None = 1.0
+        targets = [] if goal is None else plan(self._motion, goal, q, speed=1.0 if speed is None else speed)
+        with self._queue_lock:  # the arm goal is planned (or there is none): only now the gripper
+            if fingers:
+                self._width = 2.0 * float(fingers[0])  # one finger's travel -> opening width
+                if not targets and self._last is None and not self._queue:  # nothing streams yet: hold here so the width goes out
+                    position, rotation = self._motion.ee_pose(q)
+                    self._last = Target(position=position, rotation=rotation)
+            if targets:
+                self._queue = deque(targets)
+        if goal is None or not wait_for_execution or goal.mode == TWIST:
             return True
         return self._wait_reached(goal, timeout=2.0 + 2.0 * len(targets) * MOTION_DT)
 
@@ -732,21 +745,21 @@ class ROS2Robot(Robot):
         if the planner refuses `home`), call `service` (GUIDE's Reset), then wait on sim time until the tool is within the reach tolerance of
         `home` (the scene's default_joint_states[:7], where the host homes the arm), for at most
         2 s + 2 x the homing plan's duration (the host plans it at speed 1.0)."""
-        from guide_motion.planner import PlanningError, plan
+        from guide_motion.planner import plan
         from guide_motion.targets import JOINTS, Target
 
         goal = Target(mode=JOINTS, joints=np.asarray(home, float))
-        try:  # before hold_off: a home the planner refuses changes nothing
-            homing = plan(self._motion, goal, self._arm_state()[0], speed=1.0)
-        except PlanningError as error:
-            self.node.get_logger().error(f"guide_motion planner, homing: {error}")
+        try:
+            homing = plan(self._motion, goal, self._arm_state()[0], speed=1.0)  # before hold_off: a refused home changes nothing
+            self.hold_off()
+            response = self.callService(service, request, "Resetting the scene")
+            if not response.success:
+                self.node.get_logger().error(f"Reset failed: {response.message}")
+                return False
+            return self._wait_reached(goal, timeout=2.0 + 2.0 * len(homing) * MOTION_DT)
+        except _oscbf_failures() as error:
+            self.node.get_logger().error(f"reset_scene: {type(error).__name__}: {error}")
             return False
-        self.hold_off()
-        response = self.callService(service, request, "Resetting the scene")
-        if not response.success:
-            self.node.get_logger().error(f"Reset failed: {response.message}")
-            return False
-        return self._wait_reached(goal, timeout=2.0 + 2.0 * len(homing) * MOTION_DT)
 
     def _arm_state(self):
         js = self.joint_state
@@ -769,6 +782,7 @@ class ROS2Robot(Robot):
             if now != last:
                 last, wall = now, time.perf_counter()
             elif time.perf_counter() - wall > stall_timeout:
+                message = f"The clock did not advance for {stall_timeout} s of wall time; is the simulation running?"
                 break
             q, qd = self._arm_state()
             p, R = self._motion.ee_pose(q)
@@ -779,5 +793,8 @@ class ROS2Robot(Robot):
             if held is not None and now - held >= Duration(seconds=0.1):
                 return True
             time.sleep(0.002)
-        self.node.get_logger().error(f"OSCBF move timed out after {timeout:.1f} s of sim time.")
+        else:
+            message = f"OSCBF move timed out after {timeout:.1f} s of sim time."
+        self.node.get_logger().error(message)
+        self.hold_off()  # False means stopped: the host holds the latched pose, not the goal the caller was told failed
         return False
