@@ -17,6 +17,7 @@ This project was heavily inspired by the foundational work in [ycheng517/lerobot
 - **MoveIt Servo Support:** Added support for real-time Cartesian velocity control using MoveIt Servo, allowing for smooth and responsive teleoperation or policy execution.
 - **Extended Action Spaces:** Full compatibility with various action and observation formulations, including Cartesian poses, joint positions, and velocities.
 - **Real-Time Vision Bridging:** Integrated `cv_bridge` to seamlessly process real-time ROS 2 Image topics into LeRobot-compatible camera observation formats.
+- **OSCBF mode (`controller="oscbf"`, GUIDE S2b):** instead of MoveIt, `guide_motion` plans every move and `guide_msgs/MotionTarget`s stream at 20 Hz of sim time to the OSCBF controller in the simulator's control loop (`<namespace>/motion_target`). Poses must be in the robot's base frame (`frame_id` = the base link). `send_action(..., speed=, min_fraction=)`: `speed` 0 to 1 is MoveIt's velocity scaling or the planner's cruise speed (speed x 0.5 m/s); `min_fraction` refuses a straight-line move MoveIt can compute only partly. `robot.sleep(seconds)` waits on the node's (sim) clock.
 
 ## Prerequisites
 
