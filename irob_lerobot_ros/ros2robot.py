@@ -24,6 +24,7 @@ from .config import ROS2RobotConfig
 from pymoveit2 import MoveIt2
 from pymoveit2 import GripperInterface
 from pymoveit2 import MoveIt2Servo
+from pymoveit2.utils import spin_or_wait
 
 import rclpy
 from rclpy.node import Node
@@ -448,15 +449,18 @@ class ROS2Robot(Robot):
             # MoveIt executes whatever part of a Cartesian path it could compute and reports success
             # (pymoveit2's threshold defaults to 0): stopping short of a cube, or at the edge of a
             # self-collision no later plan can start from. Ask for the path first.
-            if isinstance(action, Pose) and cartesian and min_fraction > 0 and self._moveit2.plan(
-                pose=action,
-                frame_id=self.config.frame_id,
-                cartesian=True,
-                cartesian_fraction_threshold=min_fraction,
-                start_joint_state=self.joint_state,
-            ) is None:
-                self.node.get_logger().warning(f"No straight path (< {min_fraction:.0%}) to the pose; not executed.")
-                return False
+            if isinstance(action, Pose) and cartesian and min_fraction > 0:
+                future = self._moveit2.plan_async(
+                    pose=action, frame_id=self.config.frame_id, cartesian=True, start_joint_state=self.joint_state)
+                while future is not None and not future.done():
+                    spin_or_wait(self.node)  # MoveIt2.plan's wait; plan() itself keeps the fraction to itself
+                if future is None or self._moveit2.get_trajectory(
+                        future, cartesian=True, cartesian_fraction_threshold=min_fraction) is None:
+                    p, fraction = action.position, future.result().fraction if future is not None else 0.0
+                    self.node.get_logger().warning(
+                        f"No straight path to x={p.x:.3f}, y={p.y:.3f}, z={p.z:.3f}: MoveIt computed "
+                        f"{fraction:.0%} of it (< {min_fraction:.0%}); not executed.")
+                    return False
             if isinstance(action, Pose):
                 pose_stamped = PoseStamped()
                 pose_stamped.header = Header()
@@ -654,8 +658,8 @@ class ROS2Robot(Robot):
                 target, width = self._last, self._width
                 if target is not None and target.mode == TWIST:
                     self._last = None  # one-shot, like a servo command: the host holds the pose after 0.25 s
-            if target is not None:
-                self._motion_pub.publish(self._motion_target_msg(target, width))
+                if target is not None:  # under the lock: once hold_off() returns, nothing it cleared goes out
+                    self._motion_pub.publish(self._motion_target_msg(target, width))
 
     def _motion_target_msg(self, target, width):
         msg = self._motion_msg()
@@ -724,16 +728,20 @@ class ROS2Robot(Robot):
             self._queue, self._last = deque(), None
 
     def reset_scene(self, service, request, home) -> bool:
-        """GUIDE's Reset under controller: oscbf, the one Reset path: hold off first, call `service`
-        (GUIDE's Reset), then wait on sim time until the tool is within the reach tolerance of
+        """GUIDE's Reset under controller: oscbf, the one Reset path: hold off (False, nothing changed,
+        if the planner refuses `home`), call `service` (GUIDE's Reset), then wait on sim time until the tool is within the reach tolerance of
         `home` (the scene's default_joint_states[:7], where the host homes the arm), for at most
         2 s + 2 x the homing plan's duration (the host plans it at speed 1.0)."""
-        from guide_motion.planner import plan
+        from guide_motion.planner import PlanningError, plan
         from guide_motion.targets import JOINTS, Target
 
-        self.hold_off()
         goal = Target(mode=JOINTS, joints=np.asarray(home, float))
-        homing = plan(self._motion, goal, self._arm_state()[0], speed=1.0)
+        try:  # before hold_off: a home the planner refuses changes nothing
+            homing = plan(self._motion, goal, self._arm_state()[0], speed=1.0)
+        except PlanningError as error:
+            self.node.get_logger().error(f"guide_motion planner, homing: {error}")
+            return False
+        self.hold_off()
         response = self.callService(service, request, "Resetting the scene")
         if not response.success:
             self.node.get_logger().error(f"Reset failed: {response.message}")

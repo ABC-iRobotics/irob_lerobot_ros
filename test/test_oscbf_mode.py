@@ -101,12 +101,41 @@ def test_sleep_keeps_the_remaining_time_when_the_clock_restarts(make):
     assert clock.restarted and 0.70e9 <= clock.t <= 0.75e9  # 0.3 s before the restart + 0.7 s after: 1 s of sim time
 
 
+def moveit_computing(fraction, moved):
+    """A fake MoveIt whose straight-line plan covers `fraction` of the way; records executed moves."""
+    planned = SimpleNamespace(done=lambda: True, result=lambda: SimpleNamespace(fraction=fraction))
+    return SimpleNamespace(
+        max_velocity=1.0,
+        plan_async=lambda **kwargs: planned,
+        get_trajectory=lambda future, cartesian, cartesian_fraction_threshold: object() if fraction >= cartesian_fraction_threshold else None,
+        move_to_pose=lambda **kwargs: moved.append(kwargs) or True,
+    )
+
+
 def test_moveit_refuses_a_cartesian_path_it_cannot_finish(make):
     r = make(controller="moveit")
     moved = []
-    r._moveit2 = SimpleNamespace(max_velocity=1.0, plan=lambda **kwargs: None, move_to_pose=lambda **kwargs: moved.append(kwargs) or True)
+    r._moveit2 = moveit_computing(0.6, moved)
     assert not r.send_action(Pose(), cartesian=True, wait_for_execution=True, speed=0.2, min_fraction=0.95)
     assert moved == [] and r._moveit2.max_velocity == 0.2
+
+
+def test_a_refused_straight_line_names_the_pose_and_the_fraction(make):
+    r = make(controller="moveit")
+    r._moveit2 = moveit_computing(0.6, [])
+    target = Pose()
+    target.position.x, target.position.y, target.position.z = 0.5, 0.1, 0.112
+    assert not r.send_action(target, cartesian=True, min_fraction=0.95)
+    assert r.logs[-1] == "No straight path to x=0.500, y=0.100, z=0.112: MoveIt computed 60% of it (< 95%); not executed."
+
+
+def test_moveit_executes_a_straight_line_it_can_finish(make):
+    r = make(controller="moveit")
+    r.config.gripper_action_type = ActionType.JOINT_POSITION  # a Pose passes the gripper branch by
+    moved = []
+    r._moveit2 = moveit_computing(1.0, moved)
+    assert r.send_action(Pose(), cartesian=True, min_fraction=0.95)
+    assert len(moved) == 1
 
 
 def test_observation_features_include_the_gripper(make):
@@ -283,3 +312,38 @@ def test_oscbf_never_reaches_into_moveit(make):
     p, R = r._motion.ee_pose(HOME)
     assert r.send_action(pose(p + [0.0, 0.0, -0.1], R), cartesian=True, speed=0.5, min_fraction=0.95)
     assert len(r._queue) > 1
+
+
+def test_hold_off_waits_for_a_target_in_flight(make):
+    """Plan B I2: once hold_off() returns, nothing it cleared reaches the host, not even a target
+    the stream had already popped and was publishing (tester B, C2)."""
+    from guide_motion.targets import Target
+
+    r = make()
+    publishing, release, sent = threading.Event(), threading.Event(), []
+    r._motion_target_msg = lambda target, width: target
+    r._motion_pub = SimpleNamespace(publish=lambda msg: publishing.set() or release.wait(1.0) and sent.append(msg))
+    r._stop_stream = threading.Event()
+    r._queue = deque([Target()])
+    thread = threading.Thread(target=r._stream, daemon=True)
+    thread.start()
+    assert publishing.wait(1.0)  # popped, mid-publish
+    threading.Timer(0.1, release.set).start()
+    r.hold_off()
+    before = len(sent)
+    time.sleep(0.2)
+    r._stop_stream.set()
+    thread.join()
+    assert len(sent) == before
+
+
+def test_reset_to_a_home_outside_the_limits_returns_false_and_keeps_the_stream(make):
+    r = make()
+    p, R = r._motion.ee_pose(HOME)
+    r.send_action(pose(p + [0.0, 0.2, 0.0], R))
+    queued = len(r._queue)
+    r.callService = lambda service, request, message=None: pytest.fail("no Reset without a homing plan")
+    home = list(HOME)
+    home[0] = 10.0  # rad: beyond fr3_joint1's limit
+    assert not r.reset_scene("/Sim_0/Reset", "request", home)
+    assert any("planner" in str(line) for line in r.logs) and len(r._queue) == queued
