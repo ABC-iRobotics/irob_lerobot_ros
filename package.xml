@@ -15,6 +15,8 @@
        package needs it built; without the dependency a "packages up to guide"
        colcon build silently leaves it out. -->
   <exec_depend>pymoveit2</exec_depend>
+  <!-- controller: oscbf (S2b) publishes guide_msgs/MotionTarget -->
+  <exec_depend>guide_msgs</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

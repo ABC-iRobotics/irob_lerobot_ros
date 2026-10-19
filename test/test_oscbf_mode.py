@@ -122,3 +122,164 @@ def test_observations_use_the_declared_feature_keys(make, kind):
     r.config.arm_observation_type = r.config.gripper_observation_type = kind
     r.joint_state = JointState(name=ARM + ["fr3_finger_joint1"], position=[0.0] * 8, velocity=[0.0] * 8, effort=[0.0] * 8)
     assert list(r.get_observation()) == list(r._motors_obs_ft)
+
+
+def test_a_reached_goal_must_be_held_for_a_tenth_of_a_second(make):
+    from guide_motion.targets import Target
+
+    r = make()
+    p, R = r._motion.ee_pose(HOME)
+    assert r._wait_reached(Target(position=p, rotation=R), timeout=1.0)
+    assert r.node.get_clock().t >= 0.1e9
+
+
+def test_an_arm_elsewhere_times_out_on_sim_time(make):
+    from guide_motion.targets import Target
+
+    r = make()
+    p, R = r._motion.ee_pose(HOME)
+    assert not r._wait_reached(Target(position=p + [0.1, 0, 0], rotation=R), timeout=0.3)
+    assert any("timed out" in str(line) for line in r.logs)
+
+
+def test_an_arm_at_the_goal_still_moving_has_not_arrived(make):
+    from guide_motion.targets import Target
+
+    r = make()
+    r.joint_state.velocity = [0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0]  # joint 2 at 0.1 rad/s: the tool moves ~5 cm/s
+    p, R = r._motion.ee_pose(HOME)
+    assert not r._wait_reached(Target(position=p, rotation=R), timeout=0.3)
+
+
+def test_speed_sets_the_cruise_speed_and_none_means_full_speed(make):
+    r = make()
+    p, R = r._motion.ee_pose(HOME)
+    assert r.send_action(pose(p + [0.0, 0.2, 0.0], R), wait_for_execution=False)
+    assert len(r._queue) == 19  # speed None = 1.0: cruise 0.5 m/s
+    np.testing.assert_allclose(r._queue[-1].position, p + [0.0, 0.2, 0.0], atol=1e-9)
+    assert r.send_action(pose(p + [0.0, 0.2, 0.0], R), speed=0.2)
+    assert len(r._queue) == 48  # cruise 0.1 m/s
+
+
+def test_an_unreachable_pose_returns_false(make):
+    r = make()
+    p, R = r._motion.ee_pose(HOME)
+    assert not r.send_action(pose(p + [1.5, 0.0, 0.0], R))
+    assert any("planner" in str(line) for line in r.logs)
+
+
+def test_a_finger_position_becomes_the_width_and_starts_a_hold(make):
+    r = make()
+    assert r.send_action({"fr3_finger_joint1.pos": 0.04})
+    assert r._width == pytest.approx(0.08) and r._last is not None
+    np.testing.assert_allclose(r._last.position, r._motion.ee_pose(HOME)[0])
+
+
+def test_the_stream_sends_the_plan_then_repeats_the_last_target(make):
+    from guide_motion.targets import TWIST, Target
+
+    r = make()
+    sent = []
+    r._motion_target_msg = lambda target, width: (target, width)
+    r._motion_pub = SimpleNamespace(publish=sent.append)
+    r._stop_stream = threading.Event()
+    targets = [Target(position=np.full(3, i)) for i in range(3)]
+    r._queue = deque(targets)
+    thread = threading.Thread(target=r._stream, daemon=True)
+    thread.start()
+    time.sleep(0.8)
+    assert [t for t, _ in sent[:3]] == targets and all(t is targets[-1] for t, _ in sent[3:]) and len(sent) > 4
+    assert all(np.isnan(width) for _, width in sent)  # no gripper command yet: every target leaves the hand
+    with r._queue_lock:
+        r._queue = deque([Target(mode=TWIST, twist=np.ones(6))])
+    time.sleep(0.5)
+    r._stop_stream.set()
+    thread.join()
+    twists = [t for t, _ in sent if t.mode == TWIST]
+    assert len(twists) == 1 and sent[-1][0].mode == TWIST  # one-shot, nothing after it
+
+
+def test_twist_is_queued_without_waiting(make):
+    r = make()
+    twist = Twist()
+    twist.linear.x = 0.05
+    assert r.send_action(twist, wait_for_execution=True)
+    assert r._queue[0].twist[0] == pytest.approx(0.05)
+
+
+def test_a_clock_restart_during_a_wait_still_times_out(make):
+    from guide_motion.targets import Target
+
+    r = make(clock=RestartingClock())
+    p, R = r._motion.ee_pose(HOME)
+    started = time.perf_counter()
+    assert not r._wait_reached(Target(position=p + [0.1, 0, 0], rotation=R), timeout=0.2)
+    assert time.perf_counter() - started < 5.0
+
+
+def test_a_new_goal_replaces_the_queue_and_starts_from_the_measured_state(make):
+    r = make()
+    p, R = r._motion.ee_pose(HOME)
+    r.send_action(pose(p + [0.0, 0.2, 0.0], R))
+    r.send_action(pose(p + [0.0, 0.0, -0.1], R))
+    assert np.allclose(r._queue[-1].position, p + [0.0, 0.0, -0.1])
+    assert np.linalg.norm(r._queue[0].position - p) < 0.01  # 4.6 mm from where the arm is; the old plan ended 0.2 m away
+
+
+def test_a_pose_outside_the_base_frame_is_refused(make):
+    r = make()
+    r.config.frame_id = "Scene_0"
+    p, R = r._motion.ee_pose(HOME)
+    assert not r.send_action(pose(p, R))
+    assert not r._queue and any("refused" in str(line) for line in r.logs)
+
+
+def test_a_partial_joint_goal_is_refused(make):
+    r = make()
+    assert not r.send_action({"fr3_joint1.pos": 0.0})
+    assert not r._queue
+
+
+def test_a_target_becomes_a_motion_target_message(make):
+    from guide_msgs.msg import MotionTarget
+
+    from guide_motion.targets import JOINTS, Target
+
+    r = make()
+    r._motion_msg = MotionTarget
+    msg = r._motion_target_msg(Target(mode=JOINTS, joints=np.array(HOME)), 0.08)
+    assert msg.mode == MotionTarget.MODE_JOINTS and msg.frame_id == "fr3_link0"
+    assert list(msg.joints) == pytest.approx(HOME) and msg.gripper_width == 0.08
+    assert msg.pose.orientation.w == pytest.approx(1.0)  # identity rotation for a joint target
+    assert np.isnan(r._motion_target_msg(Target(), float("nan")).gripper_width)  # NaN goes out as NaN, not 0.0
+
+
+def test_reset_holds_off_the_stream_before_it_calls_the_service(make):
+    r = make()
+    p, R = r._motion.ee_pose(HOME)
+    r.send_action(pose(p + [0.0, 0.2, 0.0], R))
+    r._last = r._queue.popleft()  # mid-plan: one target sent, the rest queued
+    seen = []
+    r.callService = lambda service, request, message=None: seen.append((len(r._queue), r._last)) or SimpleNamespace(success=True)
+    assert r.reset_scene("/Sim_0/Reset", "request", HOME)
+    assert seen == [(0, None)]  # when the host starts homing, nothing is queued or repeated
+    assert not r._queue and r._last is None  # and nothing streams until the next send_action
+
+
+def test_reset_waits_on_sim_time_for_the_home_configuration(make):
+    away = list(HOME)
+    away[0] = 0.5
+    r = make(q=away, clock=FakeClock(step=0.01))
+    r.callService = lambda service, request, message=None: SimpleNamespace(success=True)
+    assert not r.reset_scene("/Sim_0/Reset", "request", HOME)  # the arm never arrives
+    assert 3.4e9 <= r.node.get_clock().t <= 3.45e9  # timeout 2 s + 2 x 14 homing targets x 50 ms, sim time
+    r.joint_state.position = list(HOME)  # the host has homed it
+    assert r.reset_scene("/Sim_0/Reset", "request", HOME)
+
+
+def test_oscbf_never_reaches_into_moveit(make):
+    r = make()
+    r._moveit2 = None  # controller: oscbf starts no MoveIt
+    p, R = r._motion.ee_pose(HOME)
+    assert r.send_action(pose(p + [0.0, 0.0, -0.1], R), cartesian=True, speed=0.5, min_fraction=0.95)
+    assert len(r._queue) > 1

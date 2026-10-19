@@ -1,8 +1,12 @@
 import time
+from collections import deque
 from functools import cached_property
 from functools import wraps
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Optional
+
+import numpy as np
+from scipy.spatial.transform import Rotation
 
 
 
@@ -38,6 +42,8 @@ from std_msgs.msg import Header
 from geometry_msgs.msg import Pose
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Twist
+
+MOTION_DT = 0.05  # MotionTarget period, s of sim time (20 Hz, S2b; guide_motion.planner.DT)
 
 
 def executor_safe(f):
@@ -142,17 +148,16 @@ class ROS2Robot(Robot):
         # ROS2 initialization
         self._init_ros()
           
-        # Connect to MoveIt2 and Gripper interfaces based on the specified action types
-        if (self.config.arm_action_type == ActionType.JOINT_POSITION 
-            or self.config.arm_action_type == ActionType.JOINT_TRAJECTORY
-            or self.config.arm_action_type == ActionType.CARTESIAN_POSE):
-            self.init_moveit2()
-        
-        if (self.config.gripper_action_type in [ActionType.JOINT_POSITION, ActionType.JOINT_TRAJECTORY]):
-            self.init_gripper_interface()
-            
-        if (self.config.arm_action_type == ActionType.CARTESIAN_VELOCITY):
-            self.init_servo_interface()
+        if self.config.controller == "oscbf":
+            self.init_oscbf()  # guide_motion plans and streams; nothing of MoveIt is started
+        else:
+            # Connect to MoveIt2 and Gripper interfaces based on the specified action types
+            if self.config.arm_action_type in (ActionType.JOINT_POSITION, ActionType.JOINT_TRAJECTORY, ActionType.CARTESIAN_POSE):
+                self.init_moveit2()
+            if self.config.gripper_action_type in (ActionType.JOINT_POSITION, ActionType.JOINT_TRAJECTORY):
+                self.init_gripper_interface()
+            if self.config.arm_action_type == ActionType.CARTESIAN_VELOCITY:
+                self.init_servo_interface()
         
         self.joint_state_sub = self.node.create_subscription(
             JointState,
@@ -384,6 +389,8 @@ class ROS2Robot(Robot):
         arm moves (controller: oscbf plans straight lines or refuses)."""
         if not self.is_connected:
             raise DeviceNotConnectedError("Robot is not connected.")
+        if self.config.controller == "oscbf":
+            return self._send_oscbf(action, wait_for_execution, speed)
         if speed is not None and self._moveit2 is not None:
             self._moveit2.max_velocity = speed
             
@@ -535,6 +542,11 @@ class ROS2Robot(Robot):
             print(f'Disconnecting camera: {cam.topic}')
             cam.disconnect()
         
+        if getattr(self, "_stream_thread", None) is not None:
+            self._stop_stream.set()
+            self._stream_thread.join()
+            self._stream_thread = None
+
         print('Shutting down ROS node...')
         self.start.set_result(True)
         self.ros_thread.join()
@@ -606,3 +618,158 @@ class ROS2Robot(Robot):
                 pass
 
         raise last_error
+
+    # ------------------------------------------------------------------
+    # controller: oscbf (S2b): guide_motion plans, MotionTargets stream at 20 Hz of sim time
+    # to the OSCBF controller that runs in the simulator's (or the robot's) control loop.
+    # ------------------------------------------------------------------
+    def init_oscbf(self):
+        from guide_motion.model import Model
+        from guide_msgs.msg import MotionTarget
+
+        self._motion = Model.load(self.config.motion_robot)
+        assert self._motion.arm_joints == list(self.config.arm_joint_names), self._motion.arm_joints
+        self._motion_msg = MotionTarget
+        self._motion_pub = self.node.create_publisher(MotionTarget, "motion_target", 1)
+        self._queue, self._last, self._width = deque(), None, float("nan")
+        self._queue_lock, self._stop_stream = Lock(), Event()
+        self._stream_thread = Thread(target=self._stream, daemon=True)
+        self._stream_thread.start()
+
+    def _stream(self):
+        """Every 50 ms of sim time: the next planned target, else the last pose/joint target
+        again, so the controller never goes stale while it holds a goal."""
+        from guide_motion.targets import TWIST
+
+        clock = self.node.get_clock()
+        due = clock.now()
+        while not self._stop_stream.wait(0.002):  # poll the clock every 2 ms of wall time
+            now = clock.now()
+            if now < due and (due - now).nanoseconds < 1e9:  # a clock > 1 s behind restarted: send now
+                continue
+            due = now + Duration(seconds=MOTION_DT)
+            with self._queue_lock:
+                if self._queue:
+                    self._last = self._queue.popleft()
+                target, width = self._last, self._width
+                if target is not None and target.mode == TWIST:
+                    self._last = None  # one-shot, like a servo command: the host holds the pose after 0.25 s
+            if target is not None:
+                self._motion_pub.publish(self._motion_target_msg(target, width))
+
+    def _motion_target_msg(self, target, width):
+        msg = self._motion_msg()
+        msg.stamp = self.node.get_clock().now().to_msg()
+        msg.mode = int(target.mode)
+        msg.frame_id = self._motion.base_link
+        x, y, z, w = Rotation.from_matrix(target.rotation).as_quat()
+        msg.pose.position.x, msg.pose.position.y, msg.pose.position.z = (float(v) for v in target.position)
+        msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w = float(x), float(y), float(z), float(w)
+        msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z = (float(v) for v in target.twist[:3])
+        msg.twist.angular.x, msg.twist.angular.y, msg.twist.angular.z = (float(v) for v in target.twist[3:])
+        msg.joints = [float(v) for v in target.joints]
+        msg.gripper_width = float(width)  # always set: the field's default 0.0 closes the hand; NaN leaves it
+        return msg
+
+    def _send_oscbf(self, action, wait_for_execution: bool, speed: float | None) -> bool:
+        from guide_motion.planner import PlanningError, plan
+        from guide_motion.targets import JOINTS, TWIST, Target
+
+        names = list(self.config.arm_joint_names)
+        if isinstance(action, Pose):
+            # Ruling 4: poses arrive in the robot's base frame; GUIDE converts, the solver looks nothing up
+            if self.config.frame_id != self._motion.base_link:
+                self.node.get_logger().error(
+                    f"Pose in '{self.config.frame_id}', not the base frame '{self._motion.base_link}': refused.")
+                return False
+            p, o = action.position, action.orientation
+            goal = Target(position=np.array([p.x, p.y, p.z], float), rotation=Rotation.from_quat([o.x, o.y, o.z, o.w]).as_matrix())
+        elif isinstance(action, Twist):
+            v, w = action.linear, action.angular
+            goal = Target(mode=TWIST, twist=np.array([v.x, v.y, v.z, w.x, w.y, w.z], float))
+        elif isinstance(action, dict):
+            fingers = [v for k, v in action.items() if k.removesuffix(".pos") in self.config.gripper_joint_names]
+            arm = {k.removesuffix(".pos"): v for k, v in action.items() if k.removesuffix(".pos") in names}
+            if fingers:
+                with self._queue_lock:
+                    self._width = 2.0 * float(fingers[0])  # one finger's travel -> opening width
+                    if self._last is None and not self._queue:  # nothing streams yet: hold here so the width goes out
+                        position, rotation = self._motion.ee_pose(self._arm_state()[0])
+                        self._last = Target(position=position, rotation=rotation)
+            if arm and len(arm) != len(names):
+                self.node.get_logger().warn("Incomplete arm joint configuration provided in action.")
+                return False
+            if not arm:
+                return bool(fingers)
+            goal = Target(mode=JOINTS, joints=np.array([arm[j] for j in names], float))
+        else:
+            return False
+        try:
+            # Ruling 3: GUIDE-EX's speed sets the cruise speed, speed x 0.5 m/s; None = 1.0
+            targets = plan(self._motion, goal, self._arm_state()[0], speed=1.0 if speed is None else speed)
+        except PlanningError as error:
+            self.node.get_logger().error(f"guide_motion planner: {error}")
+            return False
+        with self._queue_lock:
+            self._queue = deque(targets)
+        if not wait_for_execution or goal.mode == TWIST:
+            return True
+        return self._wait_reached(goal, timeout=2.0 + 2.0 * len(targets) * MOTION_DT)
+
+    def hold_off(self) -> None:
+        """Stop streaming: nothing queued, nothing repeated (Plan B final review I2). GUIDE's Reset
+        homes the arm through the host until the next fresh target, and the 20 Hz repeat of the last
+        goal would be one within 50 ms. The next send_action resumes the stream."""
+        with self._queue_lock:
+            self._queue, self._last = deque(), None
+
+    def reset_scene(self, service, request, home) -> bool:
+        """GUIDE's Reset under controller: oscbf, the one Reset path: hold off first, call `service`
+        (GUIDE's Reset), then wait on sim time until the tool is within the reach tolerance of
+        `home` (the scene's default_joint_states[:7], where the host homes the arm), for at most
+        2 s + 2 x the homing plan's duration (the host plans it at speed 1.0)."""
+        from guide_motion.planner import plan
+        from guide_motion.targets import JOINTS, Target
+
+        self.hold_off()
+        goal = Target(mode=JOINTS, joints=np.asarray(home, float))
+        homing = plan(self._motion, goal, self._arm_state()[0], speed=1.0)
+        response = self.callService(service, request, "Resetting the scene")
+        if not response.success:
+            self.node.get_logger().error(f"Reset failed: {response.message}")
+            return False
+        return self._wait_reached(goal, timeout=2.0 + 2.0 * len(homing) * MOTION_DT)
+
+    def _arm_state(self):
+        js = self.joint_state
+        index = [js.name.index(j) for j in self.config.arm_joint_names]
+        q = np.array([js.position[i] for i in index], float)
+        qd = np.array([js.velocity[i] for i in index], float) if len(js.velocity) == len(js.name) else np.zeros(len(index))
+        return q, qd
+
+    def _wait_reached(self, goal, timeout: float, stall_timeout: float = 30.0) -> bool:
+        """Tool within 5 mm and 2 deg of the goal, slower than 1 cm/s, held 0.1 s of sim time (S2b 4.5)."""
+        from guide_motion.targets import JOINTS
+
+        position, rotation = self._motion.ee_pose(goal.joints) if goal.mode == JOINTS else (goal.position, goal.rotation)
+        clock = self.node.get_clock()
+        start = last = clock.now()
+        wall, held = time.perf_counter(), None
+        while (now := clock.now()) - start < Duration(seconds=timeout):
+            if now < start:  # the simulator restarted, and its clock with it
+                start, held = now, None
+            if now != last:
+                last, wall = now, time.perf_counter()
+            elif time.perf_counter() - wall > stall_timeout:
+                break
+            q, qd = self._arm_state()
+            p, R = self._motion.ee_pose(q)
+            reached = (np.linalg.norm(p - position) < 0.005
+                       and Rotation.from_matrix(rotation.T @ R).magnitude() < np.radians(2.0)
+                       and self._motion.ee_speed(q, qd) < 0.01)
+            held = (held or now) if reached else None
+            if held is not None and now - held >= Duration(seconds=0.1):
+                return True
+            time.sleep(0.002)
+        self.node.get_logger().error(f"OSCBF move timed out after {timeout:.1f} s of sim time.")
+        return False
