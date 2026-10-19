@@ -345,7 +345,7 @@ class ROS2Robot(Robot):
                 if self.config.arm_observation_type == ObservationType.JOINT_VELOCITY:
                     obs_dict[f'{joint_name}.vel'] = self.joint_state.velocity[idx]
                 if self.config.arm_observation_type == ObservationType.JOINT_EFFORT:
-                    obs_dict[f'{joint_name}.eff'] = self.joint_state.effort[idx]
+                    obs_dict[f'{joint_name}.effort'] = self.joint_state.effort[idx]
                     
         for joint_name in self.config.gripper_joint_names:
             if joint_name in self.joint_state.name:
@@ -355,7 +355,7 @@ class ROS2Robot(Robot):
                 if self.config.gripper_observation_type == ObservationType.JOINT_VELOCITY:
                     obs_dict[f'{joint_name}.vel'] = self.joint_state.velocity[idx]
                 if self.config.gripper_observation_type == ObservationType.JOINT_EFFORT:
-                    obs_dict[f'{joint_name}.eff'] = self.joint_state.effort[idx]
+                    obs_dict[f'{joint_name}.effort'] = self.joint_state.effort[idx]
                     
         for cam_name, cam in self.cameras.items():
             obs_dict[cam_name] = cam.read()
@@ -560,6 +560,8 @@ class ROS2Robot(Robot):
         end = last + Duration(seconds=seconds)
         wall = time.perf_counter()
         while (now := clock.now()) < end:
+            if now < last:  # the simulator restarted, and its clock with it: keep the time still to wait
+                end = now + (end - last)
             if now != last:
                 last, wall = now, time.perf_counter()
             elif time.perf_counter() - wall > stall_timeout:

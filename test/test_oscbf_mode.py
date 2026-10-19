@@ -34,6 +34,19 @@ class FakeClock:
         return Time(nanoseconds=self.t)
 
 
+class RestartingClock(FakeClock):
+    """Restarts at 0 once, `after` s past `start`, as Isaac's clock does on stop/play."""
+
+    def __init__(self, step=0.001, start=0.0, after=0.05):
+        super().__init__(step)
+        self.t, self.restart_at, self.restarted = int(start * 1e9), int((start + after) * 1e9), False
+
+    def now(self):
+        if self.t > self.restart_at and not self.restarted:
+            self.t, self.restarted = 0, True
+        return super().now()
+
+
 def robot(q=HOME, clock=None, controller="oscbf"):
     from guide_motion.model import Model
 
@@ -81,6 +94,13 @@ def test_sleep_raises_when_the_clock_stops(make):
         r.sleep(1.0, stall_timeout=0.05)
 
 
+def test_sleep_keeps_the_remaining_time_when_the_clock_restarts(make):
+    clock = RestartingClock(step=0.01, start=20.0, after=0.3)  # a RegisterScene's stop/play 0.3 s into the wait
+    r = make(clock=clock)
+    r.sleep(1.0)
+    assert clock.restarted and 0.70e9 <= clock.t <= 0.75e9  # 0.3 s before the restart + 0.7 s after: 1 s of sim time
+
+
 def test_moveit_refuses_a_cartesian_path_it_cannot_finish(make):
     r = make(controller="moveit")
     moved = []
@@ -94,3 +114,11 @@ def test_observation_features_include_the_gripper(make):
     r.config.arm_observation_type = ObservationType.JOINT_POSITION
     r.config.gripper_observation_type = ObservationType.JOINT_POSITION
     assert list(r._motors_obs_ft) == [f"{j}.pos" for j in ARM] + ["fr3_finger_joint1.pos"]
+
+
+@pytest.mark.parametrize("kind", list(ObservationType))
+def test_observations_use_the_declared_feature_keys(make, kind):
+    r = make()
+    r.config.arm_observation_type = r.config.gripper_observation_type = kind
+    r.joint_state = JointState(name=ARM + ["fr3_finger_joint1"], position=[0.0] * 8, velocity=[0.0] * 8, effort=[0.0] * 8)
+    assert list(r.get_observation()) == list(r._motors_obs_ft)
