@@ -151,6 +151,8 @@ class ROS2Robot(Robot):
             self.executor.shutdown()
         
     def connect(self):
+        if self.config.controller not in ("moveit", "oscbf"):  # anything else would silently mean MoveIt
+            raise ValueError(f"controller must be 'moveit' or 'oscbf', got {self.config.controller!r}")
     
         if self.is_connected:
             raise DeviceAlreadyConnectedError("Robot is already connected.")
@@ -694,6 +696,10 @@ class ROS2Robot(Robot):
         from guide_motion.planner import plan
         from guide_motion.targets import JOINTS, TWIST, Target
 
+        if self._motion_pub.get_subscription_count() == 0:  # every target would vanish, each try timing out
+            self.node.get_logger().error(f"no OSCBF host subscribes to {self._motion_pub.topic_name}: "
+                                         "is GUIDE running with controller: oscbf for this scene?")
+            return False
         names, fingers, goal = list(self.config.arm_joint_names), [], None
         if isinstance(action, Pose):
             # Ruling 4: poses arrive in the robot's base frame; GUIDE converts, the solver looks nothing up
@@ -769,7 +775,8 @@ class ROS2Robot(Robot):
         return q, qd
 
     def _wait_reached(self, goal, timeout: float, stall_timeout: float = 30.0) -> bool:
-        """Tool within 5 mm and 2 deg of the goal, slower than 1 cm/s, held 0.1 s of sim time (S2b 4.5)."""
+        """Tool within 5 mm and 2 deg of the goal, slower than 1 cm/s (a JOINTS goal: every joint within
+        0.01 rad as well), held 0.1 s of sim time (S2b 4.5)."""
         from guide_motion.targets import JOINTS
 
         position, rotation = self._motion.ee_pose(goal.joints) if goal.mode == JOINTS else (goal.position, goal.rotation)
@@ -788,7 +795,8 @@ class ROS2Robot(Robot):
             p, R = self._motion.ee_pose(q)
             reached = (np.linalg.norm(p - position) < 0.005
                        and Rotation.from_matrix(rotation.T @ R).magnitude() < np.radians(2.0)
-                       and self._motion.ee_speed(q, qd) < 0.01)
+                       and self._motion.ee_speed(q, qd) < 0.01
+                       and (goal.mode != JOINTS or np.max(np.abs(q - goal.joints)) < 0.01))  # a joint goal: the joints too
             held = (held or now) if reached else None
             if held is not None and now - held >= Duration(seconds=0.1):
                 return True

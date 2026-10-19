@@ -61,6 +61,8 @@ def robot(q=HOME, clock=None, controller="oscbf"):
     r.joint_state = JointState(name=ARM, position=list(q), velocity=[0.0] * 7)
     r._motion = Model.load("fr3")
     r._queue, r._last, r._width, r._queue_lock = deque(), None, float("nan"), threading.Lock()
+    r._motion_pub = SimpleNamespace(publish=lambda msg: None, get_subscription_count=lambda: 1,
+                                    topic_name="/Sim_0/Scene_0/franka/motion_target")  # GUIDE's OSCBF host listens
     return r
 
 
@@ -431,3 +433,34 @@ def test_a_stalled_clock_says_so(make):
     p, R = r._motion.ee_pose(HOME)
     assert not r._wait_reached(Target(position=p + [0.1, 0, 0], rotation=R), timeout=1.0, stall_timeout=0.05)
     assert "did not advance" in str(r.logs[-1])
+
+
+def test_nothing_is_sent_when_no_oscbf_host_listens(make):
+    """Final review I2: a scene without an OSCBF host (registered under moveit, or a second registration)
+    would swallow every target and time out each try; say why instead."""
+    r = make()
+    r._motion_pub.get_subscription_count = lambda: 0
+    p, R = r._motion.ee_pose(HOME)
+    assert not r.send_action(pose(p + [0.0, 0.0, -0.1], R), wait_for_execution=True)
+    assert not r._queue and r.logs[-1] == ("no OSCBF host subscribes to /Sim_0/Scene_0/franka/motion_target: "
+                                           "is GUIDE running with controller: oscbf for this scene?")
+
+
+def test_a_joint_goal_waits_for_the_joints_not_only_the_tool(make):
+    """Final review M2: joint 7 0.02 rad off turns the tool 1.15 deg about its own axis, inside the tool
+    tolerance (5 mm, 2 deg), but the arm is not at the joint goal yet."""
+    from guide_motion.targets import JOINTS, Target
+
+    r = make()
+    goal = np.array(HOME)
+    goal[6] += 0.02
+    assert not r._wait_reached(Target(mode=JOINTS, joints=goal), timeout=0.3)
+    assert r._wait_reached(Target(mode=JOINTS, joints=np.array(HOME)), timeout=0.3)
+
+
+def test_an_unknown_controller_is_refused_before_anything_starts(make):
+    """Final review M3: anything but moveit or oscbf used to mean MoveIt, against a scene with no move_group."""
+    r = make(controller="OSCBF")
+    r.node = None  # not connected yet
+    with pytest.raises(ValueError, match="controller must be 'moveit' or 'oscbf', got 'OSCBF'"):
+        r.connect()
