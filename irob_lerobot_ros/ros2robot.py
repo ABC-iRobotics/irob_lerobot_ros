@@ -45,6 +45,7 @@ from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Twist
 
 MOTION_DT = 0.05  # MotionTarget period, s of sim time (20 Hz, S2b; guide_motion.planner.DT)
+STALL_S, STALL_QD = 0.5, 0.02  # a move has stalled: every joint under STALL_QD rad/s for STALL_S s of sim time
 
 
 def _oscbf_failures():
@@ -737,7 +738,7 @@ class ROS2Robot(Robot):
                 self._queue = deque(targets)
         if goal is None or not wait_for_execution or goal.mode == TWIST:
             return True
-        return self._wait_reached(goal, timeout=2.0 + 2.0 * len(targets) * MOTION_DT)
+        return self._wait_reached(goal, timeout=2.0 + 2.0 * len(targets) * MOTION_DT, plan_s=len(targets) * MOTION_DT)
 
     def hold_off(self) -> None:
         """Stop streaming: nothing queued, nothing repeated (Plan B final review I2). GUIDE's Reset
@@ -762,7 +763,7 @@ class ROS2Robot(Robot):
             if not response.success:
                 self.node.get_logger().error(f"Reset failed: {response.message}")
                 return False
-            return self._wait_reached(goal, timeout=2.0 + 2.0 * len(homing) * MOTION_DT)
+            return self._wait_reached(goal, timeout=2.0 + 2.0 * len(homing) * MOTION_DT, plan_s=len(homing) * MOTION_DT)
         except _oscbf_failures() as error:
             self.node.get_logger().error(f"reset_scene: {type(error).__name__}: {error}")
             return False
@@ -774,18 +775,20 @@ class ROS2Robot(Robot):
         qd = np.array([js.velocity[i] for i in index], float) if len(js.velocity) == len(js.name) else np.zeros(len(index))
         return q, qd
 
-    def _wait_reached(self, goal, timeout: float, stall_timeout: float = 30.0) -> bool:
+    def _wait_reached(self, goal, timeout: float, stall_timeout: float = 30.0, plan_s: float | None = None) -> bool:
         """Tool within 5 mm and 2 deg of the goal, slower than 1 cm/s (a JOINTS goal: every joint within
-        0.01 rad as well), held 0.1 s of sim time (S2b 4.5)."""
+        0.01 rad as well), held 0.1 s of sim time (S2b 4.5). Given the plan's duration `plan_s`, an arm
+        that has not arrived and stays still (STALL_S under STALL_QD) once the plan has run out has
+        stalled -- on a contact, a barrier -- and fails then instead of at `timeout`."""
         from guide_motion.targets import JOINTS
 
         position, rotation = self._motion.ee_pose(goal.joints) if goal.mode == JOINTS else (goal.position, goal.rotation)
         clock = self.node.get_clock()
         start = last = clock.now()
-        wall, held = time.perf_counter(), None
+        wall, held, still = time.perf_counter(), None, None
         while (now := clock.now()) - start < Duration(seconds=timeout):
             if now < start:  # the simulator restarted, and its clock with it
-                start, held = now, None
+                start, held, still = now, None, None
             if now != last:
                 last, wall = now, time.perf_counter()
             elif time.perf_counter() - wall > stall_timeout:
@@ -800,14 +803,23 @@ class ROS2Robot(Robot):
             held = (held or now) if reached else None
             if held is not None and now - held >= Duration(seconds=0.1):
                 return True
+            stopped = (not reached and plan_s is not None and now - start >= Duration(seconds=plan_s)
+                       and np.max(np.abs(qd)) < STALL_QD)
+            still = (still or now) if stopped else None
+            if still is not None and now - still >= Duration(seconds=STALL_S):
+                message = self._missed("stalled", (now - start).nanoseconds * 1e-9, position, rotation)
+                break
             time.sleep(0.002)
         else:
-            q, _ = self._arm_state()
-            p, R = self._motion.ee_pose(q)
-            message = (f"OSCBF move timed out after {timeout:.1f} s of sim time, "
-                       f"{1000 * np.linalg.norm(p - position):.1f} mm and "
-                       f"{np.degrees(Rotation.from_matrix(rotation.T @ R).magnitude()):.1f} deg from the goal "
-                       f"at q={np.round(q, 4).tolist()}")
+            message = self._missed("timed out", timeout, position, rotation)
         self.node.get_logger().error(message)
         self.hold_off()  # False means stopped: the host holds the latched pose, not the goal the caller was told failed
         return False
+
+    def _missed(self, verb: str, seconds: float, position, rotation) -> str:
+        """How far the tool is from the goal, and the joints, for a move that failed."""
+        q, _ = self._arm_state()
+        p, R = self._motion.ee_pose(q)
+        return (f"OSCBF move {verb} after {seconds:.1f} s of sim time, {1000 * np.linalg.norm(p - position):.1f} mm and "
+                f"{np.degrees(Rotation.from_matrix(rotation.T @ R).magnitude()):.1f} deg from the goal "
+                f"at q={np.round(q, 4).tolist()}")

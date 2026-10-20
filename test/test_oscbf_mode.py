@@ -173,6 +173,28 @@ def test_an_arm_elsewhere_times_out_on_sim_time(make):
     assert any("timed out" in str(line) and "mm and" in str(line) and "q=[" in str(line) for line in r.logs)  # names what is left
 
 
+def test_a_still_arm_short_of_the_goal_fails_once_the_plan_has_run_out(make):
+    from guide_motion.targets import Target
+
+    from irob_lerobot_ros.ros2robot import STALL_S
+
+    r = make()
+    p, R = r._motion.ee_pose(HOME)
+    assert not r._wait_reached(Target(position=p + [0.02, 0, 0], rotation=R), timeout=10.0, plan_s=0.4)
+    assert 0.4 + STALL_S <= r.node.get_clock().t * 1e-9 < 0.4 + STALL_S + 0.1  # not at the 10 s timeout
+    assert any("stalled" in str(line) and "20.0 mm and" in str(line) for line in r.logs)
+
+
+def test_a_moving_arm_short_of_the_goal_waits_for_the_timeout(make):
+    from guide_motion.targets import Target
+
+    r = make()
+    r.joint_state.velocity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05]  # the wrist still turning: not stalled
+    p, R = r._motion.ee_pose(HOME)
+    assert not r._wait_reached(Target(position=p + [0.02, 0, 0], rotation=R), timeout=1.5, plan_s=0.0)
+    assert r.node.get_clock().t >= 1.5e9 and any("timed out" in str(line) for line in r.logs)
+
+
 def test_an_arm_at_the_goal_still_moving_has_not_arrived(make):
     from guide_motion.targets import Target
 
@@ -303,7 +325,7 @@ def test_reset_waits_on_sim_time_for_the_home_configuration(make):
     r = make(q=away, clock=FakeClock(step=0.01))
     r.callService = lambda service, request, message=None: SimpleNamespace(success=True)
     assert not r.reset_scene("/Sim_0/Reset", "request", HOME)  # the arm never arrives
-    assert 3.4e9 <= r.node.get_clock().t <= 3.45e9  # timeout 2 s + 2 x 14 homing targets x 50 ms, sim time
+    assert 1.2e9 <= r.node.get_clock().t <= 1.25e9  # stalled: 14 homing targets x 50 ms, then 0.5 s still, sim time
     r.joint_state.position = list(HOME)  # the host has homed it
     assert r.reset_scene("/Sim_0/Reset", "request", HOME)
     r.joint_state.position = list(away)  # a scene whose default_joint_states is `away`, not the XRDF default
@@ -354,12 +376,12 @@ def test_reset_to_a_home_outside_the_limits_returns_false_and_keeps_the_stream(m
 
 
 def test_a_pose_move_waits_on_sim_time_and_holds_off_when_it_times_out(make):
-    """Review C2 I2b + M3: wait_for_execution=True waits 2 s + 2 x the plan (15 targets: 3.5 s of sim
-    time); False then means stopped: the failed goal is no longer streamed."""
+    """Review C2 I2b + M3: wait_for_execution=True waits for the plan (15 targets: 0.75 s of sim time),
+    then gives a still arm 0.5 s; False then means stopped: the failed goal is no longer streamed."""
     r = make(clock=FakeClock(step=0.01))
     p, R = r._motion.ee_pose(HOME)
     assert not r.send_action(pose(p + [0.0, 0.0, -0.1], R), wait_for_execution=True)  # the arm never moves
-    assert 3.5e9 <= r.node.get_clock().t <= 3.55e9
+    assert 1.25e9 <= r.node.get_clock().t <= 1.3e9
     assert not r._queue and r._last is None
 
 
