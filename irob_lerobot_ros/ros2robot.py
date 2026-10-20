@@ -802,7 +802,12 @@ class ROS2Robot(Robot):
                 return True
             time.sleep(0.002)
         else:
-            message = f"OSCBF move timed out after {timeout:.1f} s of sim time."
+            q, _ = self._arm_state()
+            p, R = self._motion.ee_pose(q)
+            message = (f"OSCBF move timed out after {timeout:.1f} s of sim time, "
+                       f"{1000 * np.linalg.norm(p - position):.1f} mm and "
+                       f"{np.degrees(Rotation.from_matrix(rotation.T @ R).magnitude()):.1f} deg from the goal "
+                       f"at q={np.round(q, 4).tolist()}")
         self.node.get_logger().error(message)
         self.hold_off()  # False means stopped: the host holds the latched pose, not the goal the caller was told failed
         return False

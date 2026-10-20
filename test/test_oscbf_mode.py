@@ -170,7 +170,7 @@ def test_an_arm_elsewhere_times_out_on_sim_time(make):
     r = make()
     p, R = r._motion.ee_pose(HOME)
     assert not r._wait_reached(Target(position=p + [0.1, 0, 0], rotation=R), timeout=0.3)
-    assert any("timed out" in str(line) for line in r.logs)
+    assert any("timed out" in str(line) and "mm and" in str(line) and "q=[" in str(line) for line in r.logs)  # names what is left
 
 
 def test_an_arm_at_the_goal_still_moving_has_not_arrived(make):
