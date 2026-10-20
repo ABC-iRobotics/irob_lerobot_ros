@@ -185,14 +185,32 @@ def test_a_still_arm_short_of_the_goal_fails_once_the_plan_has_run_out(make):
     assert any("stalled" in str(line) and "20.0 mm and" in str(line) for line in r.logs)
 
 
-def test_a_moving_arm_short_of_the_goal_waits_for_the_timeout(make):
+def test_an_arm_closing_in_slowly_waits_for_the_timeout(make):
     from guide_motion.targets import Target
 
     r = make()
-    r.joint_state.velocity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05]  # the wrist still turning: not stalled
-    p, R = r._motion.ee_pose(HOME)
-    assert not r._wait_reached(Target(position=p + [0.02, 0, 0], rotation=R), timeout=1.5, plan_s=0.0)
+    clock, q0 = r.node.get_clock(), np.array(HOME)
+    state = r._arm_state
+    # the wrist turns 4 deg/s towards a goal 20 deg away: slow, but progress (> 0.5 deg per 0.5 s)
+    r._arm_state = lambda: (q0 + [0, 0, 0, 0, 0, 0, np.radians(4.0) * clock.t * 1e-9], state()[1])
+    p, R = r._motion.ee_pose(q0 + [0, 0, 0, 0, 0, 0, np.radians(20.0)])
+    assert not r._wait_reached(Target(position=p, rotation=R), timeout=1.5, plan_s=0.0)
     assert r.node.get_clock().t >= 1.5e9 and any("timed out" in str(line) for line in r.logs)
+
+
+def test_a_jittering_arm_that_makes_no_progress_has_stalled(make):
+    from guide_motion.targets import Target
+
+    from irob_lerobot_ros.ros2robot import STALL_S
+
+    r = make()
+    clock, q0 = r.node.get_clock(), np.array(HOME)
+    state = r._arm_state
+    # pushing on a contact: the joints shake (0.3 rad/s) but the tool gets no closer
+    r._arm_state = lambda: (q0 + [0, 0.002 * np.sin(clock.t * 1e-9 * 150), 0, 0, 0, 0, 0], state()[1] + 0.3)
+    p, R = r._motion.ee_pose(HOME)
+    assert not r._wait_reached(Target(position=p + [0.025, 0, 0], rotation=R), timeout=10.0, plan_s=0.2)
+    assert r.node.get_clock().t * 1e-9 < 0.2 + STALL_S + 0.1 and any("stalled" in str(line) for line in r.logs)
 
 
 def test_an_arm_at_the_goal_still_moving_has_not_arrived(make):

@@ -45,7 +45,8 @@ from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Twist
 
 MOTION_DT = 0.05  # MotionTarget period, s of sim time (20 Hz, S2b; guide_motion.planner.DT)
-STALL_S, STALL_QD = 0.5, 0.02  # a move has stalled: every joint under STALL_QD rad/s for STALL_S s of sim time
+# a move has stalled: STALL_S s of sim time without the tool closing STALL_M or STALL_RAD on the goal
+STALL_S, STALL_M, STALL_RAD = 0.5, 0.001, np.radians(0.5)
 
 
 def _oscbf_failures():
@@ -778,17 +779,18 @@ class ROS2Robot(Robot):
     def _wait_reached(self, goal, timeout: float, stall_timeout: float = 30.0, plan_s: float | None = None) -> bool:
         """Tool within 5 mm and 2 deg of the goal, slower than 1 cm/s (a JOINTS goal: every joint within
         0.01 rad as well), held 0.1 s of sim time (S2b 4.5). Given the plan's duration `plan_s`, an arm
-        that has not arrived and stays still (STALL_S under STALL_QD) once the plan has run out has
-        stalled -- on a contact, a barrier -- and fails then instead of at `timeout`."""
+        that has not arrived and makes no progress (STALL_S without closing STALL_M or STALL_RAD) once
+        the plan has run out has stalled -- on a contact, a barrier; it may still jitter -- and fails
+        then instead of at `timeout`."""
         from guide_motion.targets import JOINTS
 
         position, rotation = self._motion.ee_pose(goal.joints) if goal.mode == JOINTS else (goal.position, goal.rotation)
         clock = self.node.get_clock()
         start = last = clock.now()
-        wall, held, still = time.perf_counter(), None, None
+        wall, held, mark = time.perf_counter(), None, None
         while (now := clock.now()) - start < Duration(seconds=timeout):
             if now < start:  # the simulator restarted, and its clock with it
-                start, held, still = now, None, None
+                start, held, mark = now, None, None
             if now != last:
                 last, wall = now, time.perf_counter()
             elif time.perf_counter() - wall > stall_timeout:
@@ -796,17 +798,19 @@ class ROS2Robot(Robot):
                 break
             q, qd = self._arm_state()
             p, R = self._motion.ee_pose(q)
-            reached = (np.linalg.norm(p - position) < 0.005
-                       and Rotation.from_matrix(rotation.T @ R).magnitude() < np.radians(2.0)
+            dist, angle = np.linalg.norm(p - position), Rotation.from_matrix(rotation.T @ R).magnitude()
+            reached = (dist < 0.005
+                       and angle < np.radians(2.0)
                        and self._motion.ee_speed(q, qd) < 0.01
                        and (goal.mode != JOINTS or np.max(np.abs(q - goal.joints)) < 0.01))  # a joint goal: the joints too
             held = (held or now) if reached else None
             if held is not None and now - held >= Duration(seconds=0.1):
                 return True
-            stopped = (not reached and plan_s is not None and now - start >= Duration(seconds=plan_s)
-                       and np.max(np.abs(qd)) < STALL_QD)
-            still = (still or now) if stopped else None
-            if still is not None and now - still >= Duration(seconds=STALL_S):
+            if plan_s is None or reached or now - start < Duration(seconds=plan_s):
+                mark = None
+            elif mark is None or dist < mark[1] - STALL_M or angle < mark[2] - STALL_RAD:
+                mark = (now, dist, angle)  # progress: the window starts again
+            elif now - mark[0] >= Duration(seconds=STALL_S):
                 message = self._missed("stalled", (now - start).nanoseconds * 1e-9, position, rotation)
                 break
             time.sleep(0.002)
