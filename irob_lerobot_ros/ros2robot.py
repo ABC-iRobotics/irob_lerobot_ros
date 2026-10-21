@@ -777,8 +777,9 @@ class ROS2Robot(Robot):
         return q, qd
 
     def _wait_reached(self, goal, timeout: float, stall_timeout: float = 30.0, plan_s: float | None = None) -> bool:
-        """Tool within 5 mm and 2 deg of the goal, slower than 1 cm/s (a JOINTS goal: every joint within
-        0.01 rad as well), held 0.1 s of sim time (S2b 4.5). Given the plan's duration `plan_s`, an arm
+        """Tool within 5 mm and 2 deg of the goal (a JOINTS goal: every joint within 0.01 rad as well) for
+        0.1 s of sim time, moving less than 1 mm in it (S2b 4.5; the tool's own displacement, not the joint
+        velocities, which chatter while the fingers squeeze a fixed handle). Given the plan's duration `plan_s`, an arm
         that has not arrived and makes no progress (STALL_S without closing STALL_M or STALL_RAD) once
         the plan has run out has stalled -- on a contact, a barrier; it may still jitter -- and fails
         then instead of at `timeout`."""
@@ -796,16 +797,17 @@ class ROS2Robot(Robot):
             elif time.perf_counter() - wall > stall_timeout:
                 message = f"The clock did not advance for {stall_timeout} s of wall time; is the simulation running?"
                 break
-            q, qd = self._arm_state()
+            q, _ = self._arm_state()
             p, R = self._motion.ee_pose(q)
             dist, angle = np.linalg.norm(p - position), Rotation.from_matrix(rotation.T @ R).magnitude()
             reached = (dist < 0.005
                        and angle < np.radians(2.0)
-                       and self._motion.ee_speed(q, qd) < 0.01
                        and (goal.mode != JOINTS or np.max(np.abs(q - goal.joints)) < 0.01))  # a joint goal: the joints too
-            held = (held or now) if reached else None
-            if held is not None and now - held >= Duration(seconds=0.1):
-                return True
+            held = (held or (now, p)) if reached else None
+            if held is not None and now - held[0] >= Duration(seconds=0.1):
+                if np.linalg.norm(p - held[1]) < 0.001:
+                    return True
+                held = (now, p)  # still moving through: the hold starts again
             if plan_s is None or reached or now - start < Duration(seconds=plan_s):
                 mark = None
             elif mark is None or dist < mark[1] - STALL_M or angle < mark[2] - STALL_RAD:

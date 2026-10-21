@@ -217,9 +217,22 @@ def test_an_arm_at_the_goal_still_moving_has_not_arrived(make):
     from guide_motion.targets import Target
 
     r = make()
-    r.joint_state.velocity = [0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0]  # joint 2 at 0.1 rad/s: the tool moves ~5 cm/s
+    clock, q0 = r.node.get_clock(), np.array(HOME)
+    state = r._arm_state
+    # joint 2 at 0.05 rad/s through the goal: the tool moves ~2.5 cm/s, inside 5 mm for the whole wait
+    r._arm_state = lambda: (q0 + [0, 0.05 * (clock.t * 1e-9 - 0.15), 0, 0, 0, 0, 0], state()[1])
     p, R = r._motion.ee_pose(HOME)
     assert not r._wait_reached(Target(position=p, rotation=R), timeout=0.3)
+
+
+def test_an_arm_chattering_on_a_held_handle_has_arrived(make):
+    from guide_motion.targets import Target
+
+    r = make()
+    # fingers squeezing a fixed bar: the joint velocities read 5 cm/s at the tool, the tool does not move
+    r.joint_state.velocity = [0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0]
+    p, R = r._motion.ee_pose(HOME)
+    assert r._wait_reached(Target(position=p, rotation=R), timeout=0.3)
 
 
 def test_speed_sets_the_cruise_speed_and_none_means_full_speed(make):
