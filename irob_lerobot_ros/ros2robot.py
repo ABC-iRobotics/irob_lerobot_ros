@@ -45,6 +45,7 @@ from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Twist
 
 MOTION_DT = 0.05  # MotionTarget period, s of sim time (20 Hz, S2b; guide_motion.planner.DT)
+HANDOVER_S = 0.3  # a free end returns this long (sim time) before its blend point, for the next move to plan
 # a move has stalled: STALL_S s of sim time without the tool closing STALL_M or STALL_RAD on the goal
 STALL_S, STALL_M, STALL_RAD = 0.5, 0.001, np.radians(0.5)
 
@@ -108,7 +109,8 @@ class ROS2Robot(Robot):
         self._moveit2: Optional[MoveIt2] = None
         self._gripper_interface: Optional[GripperInterface] = None
         self._servo_interface: Optional[MoveIt2Servo] = None
-        
+        self._noise = None  # guide_motion.noise.Noise under controller: oscbf with config.motion_noise
+
         self.joint_state_sub: Subscription = None
         self.joint_state: JointState = None
         
@@ -396,15 +398,23 @@ class ROS2Robot(Robot):
             
 
     def send_action(self, action: Pose | Twist | dict[str, float], cartesian=False, wait_for_execution=False,
-                    speed: float | None = None, min_fraction: float = 0.0) -> bool:
+                    speed: float | None = None, min_fraction: float = 0.0, perturb: bool = False,
+                    precise_end: bool = True, jitter=None) -> bool:
         """speed: GUIDE-EX's speed, 0 to 1: MoveIt's velocity scaling (None keeps the current one), or
         controller: oscbf's cruise speed, speed x 0.5 m/s (None = 1.0). min_fraction: MoveIt's; a
         Cartesian path MoveIt can compute for less than this share of the way is refused before the
-        arm moves (controller: oscbf plans straight lines or refuses)."""
+        arm moves (controller: oscbf plans straight lines or refuses).
+
+        With config.motion_noise (controller: oscbf, pose goals; ignored otherwise): perturb = an aim
+        error around the planned path; precise_end=False = a free end, no settling: the call returns
+        just before the end and the next pose move blends in; jitter = (x, y, z m, yaw rad), a uniform
+        random offset of the goal."""
         if not self.is_connected:
             raise DeviceNotConnectedError("Robot is not connected.")
         if self.config.controller == "oscbf":
             try:
+                if self._noise is not None and isinstance(action, Pose):
+                    return self._send_noisy(action, wait_for_execution, speed, perturb, precise_end, jitter)
                 return self._send_oscbf(action, wait_for_execution, speed)
             except _oscbf_failures() as error:
                 self.node.get_logger().error(f"guide_motion planner refused the action: {type(error).__name__}: {error}")
@@ -654,6 +664,12 @@ class ROS2Robot(Robot):
         self._motion_pub = self.node.create_publisher(MotionTarget, "motion_target", 1)
         self._queue, self._last, self._width = deque(), None, float("nan")
         self._queue_lock, self._stop_stream = Lock(), Event()
+        if self.config.motion_noise is not None:
+            from guide_motion.noise import Noise
+
+            self._noise = Noise(self.config.motion_noise)
+            self.node.get_logger().info(f"Motion noise on, trajectory master seed {self._noise.master}: {self.config.motion_noise}")
+        self._streaming = None  # a free-end move still in the queue: (its route, its targets)
         self._stream_thread = Thread(target=self._stream, daemon=True)
         self._stream_thread.start()
 
@@ -726,6 +742,8 @@ class ROS2Robot(Robot):
                 return False
         else:
             return False
+        if self._noise is not None and goal is not None:  # a joint or twist move: the next pose move starts afresh
+            self._noise.prev, self._streaming = None, None
         q = self._arm_state()[0]
         # Ruling 3: GUIDE-EX's speed sets the cruise speed, speed x 0.5 m/s; None = 1.0
         targets = [] if goal is None else plan(self._motion, goal, q, speed=1.0 if speed is None else speed)
@@ -746,7 +764,85 @@ class ROS2Robot(Robot):
         homes the arm through the host until the next fresh target, and the 20 Hz repeat of the last
         goal would be one within 50 ms. The next send_action resumes the stream."""
         with self._queue_lock:
-            self._queue, self._last = deque(), None
+            self._queue, self._last, self._streaming = deque(), None, None
+        if self._noise is not None:
+            self._noise.prev = None
+
+    def motion_episode(self, *key):
+        """Seed the coming episode's motion noise by `key` (e.g. scene id, episode number): the same
+        key repeats the same routes. Returns the trajectory master seed, None when the noise is off."""
+        if self._noise is None:
+            return None
+        self._noise.episode(*key)
+        self._streaming = None
+        return self._noise.master
+
+    def _send_noisy(self, action, wait_for_execution, speed, perturb, precise_end, jitter) -> bool:
+        """A pose move under config.motion_noise (send_action): the planner's Pink IK tracks the noise's
+        route. A move after a free end takes the queue over at the blend point, planned from the target
+        there, so the arm never stops; a free end returns HANDOVER_S of sim time before that point."""
+        from dataclasses import replace
+
+        from guide_motion.planner import MAX_SPEED, plan
+        from guide_motion.targets import Target
+
+        if self.config.frame_id != self._motion.base_link:
+            self.node.get_logger().error(
+                f"Pose in '{self.config.frame_id}', not the base frame '{self._motion.base_link}': refused.")
+            return False
+        p, o = action.position, action.orientation
+        goal = Target(position=np.array([p.x, p.y, p.z], float), rotation=Rotation.from_quat([o.x, o.y, o.z, o.w]).as_matrix())
+        noise = self._noise
+        rng = noise.move()
+        speed = min(1.0, (1.0 if speed is None else speed) * rng.uniform(*noise.params.speed_scale))
+        if jitter is not None:
+            j = rng.uniform(-1.0, 1.0, 4) * np.asarray(jitter, float)
+            goal = replace(goal, position=goal.position + j[:3],
+                           rotation=Rotation.from_rotvec([0.0, 0.0, j[3]]).as_matrix() @ goal.rotation)
+        q, v0, handover = self._arm_state()[0], 0.0, None
+        with self._queue_lock:
+            if self._streaming is not None and self._queue:
+                route, planned = self._streaming
+                tail, head = list(self._queue), len(planned) - len(self._queue)
+                r = min(noise.params.blend, 0.45 * route.length)
+                k = next((i for i in range(len(tail)) if (1.0 - route.s[head + i]) * route.length <= r), None)
+                if k is not None:
+                    self._queue = deque(tail[:k + 1])  # A runs on to the blend point while B is planned
+                    q, handover = tail[k].joints, route.s[head + k]
+                    if head + k > 0:
+                        v0 = np.linalg.norm(tail[k].position - planned[head + k - 1].position) / MOTION_DT
+            self._streaming = None
+        route = noise.route(rng, self._motion.ee_pose(q)[0], goal.position, speed * MAX_SPEED, perturb,
+                            free_end=not precise_end, handover=handover)
+        targets = plan(self._motion, goal, q, speed=speed, route=route, v0=v0, stop=precise_end)
+        with self._queue_lock:
+            if handover is not None:
+                self._queue.extend(targets)  # empty by now if planning outlasted the tail: the arm held the blend point
+            else:
+                self._queue = deque(targets)
+            if not precise_end and route is not None:
+                self._streaming = (route, targets)
+        if not precise_end and route is not None:
+            remaining = sum((1.0 - s) * route.length <= noise.params.blend for s in route.s)
+            return self._wait_queue(remaining + round(HANDOVER_S / MOTION_DT))
+        if not wait_for_execution:
+            return True
+        end = targets[-1]
+        return self._wait_reached(end, timeout=2.0 + 2.0 * len(targets) * MOTION_DT, plan_s=len(targets) * MOTION_DT)
+
+    def _wait_queue(self, left: int, stall_timeout: float = 30.0) -> bool:
+        """Until at most `left` targets are queued (the stream pops them on sim time); False if the queue
+        has not moved for stall_timeout s of wall time (the simulation stopped)."""
+        size, since = None, time.perf_counter()
+        while (n := len(self._queue)) > left:
+            if n != size:
+                size, since = n, time.perf_counter()
+            elif time.perf_counter() - since > stall_timeout:
+                self.node.get_logger().error(f"The motion queue did not move for {stall_timeout} s; is the simulation running?")
+                self.hold_off()
+                return False
+            time.sleep(0.002)
+        return True
 
     def reset_scene(self, service, request, home) -> bool:
         """GUIDE's Reset under controller: oscbf, the one Reset path: hold off (False, nothing changed,

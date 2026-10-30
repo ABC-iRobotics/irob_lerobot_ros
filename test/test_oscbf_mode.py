@@ -61,6 +61,7 @@ def robot(q=HOME, clock=None, controller="oscbf"):
     r.joint_state = JointState(name=ARM, position=list(q), velocity=[0.0] * 7)
     r._motion = Model.load("fr3")
     r._queue, r._last, r._width, r._queue_lock = deque(), None, float("nan"), threading.Lock()
+    r._noise, r._streaming = None, None
     r._motion_pub = SimpleNamespace(publish=lambda msg: None, get_subscription_count=lambda: 1,
                                     topic_name="/Sim_0/Scene_0/franka/motion_target")  # GUIDE's OSCBF host listens
     return r

@@ -45,6 +45,9 @@ class ROS2RobotConfig(RobotConfig):
     # MotionTargets at 20 Hz to the OSCBF controller in the simulator's or robot's control loop).
     controller: str = "moveit"
     motion_robot: str = ""  # guide_motion robot description for controller: oscbf ("fr3", "panda")
+    # controller: oscbf only: a guide_motion.noise.NoiseParams perturbs the moves that ask for it
+    # (DART-style demonstrations); None = off, every move exactly as planned.
+    motion_noise: object = None
     
     # MoveIt2 specific configurations
     arm_joint_names: List[str] = field(
