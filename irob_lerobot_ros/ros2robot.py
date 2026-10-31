@@ -708,6 +708,7 @@ class ROS2Robot(Robot):
         msg.twist.angular.x, msg.twist.angular.y, msg.twist.angular.z = (float(v) for v in target.twist[3:])
         msg.joints = [float(v) for v in target.joints]
         msg.gripper_width = float(width)  # always set: the field's default 0.0 closes the hand; NaN leaves it
+        msg.clean.x, msg.clean.y, msg.clean.z = (float(v) for v in target.clean)
         return msg
 
     def _send_oscbf(self, action, wait_for_execution: bool, speed: float | None) -> bool:
