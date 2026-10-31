@@ -768,12 +768,13 @@ class ROS2Robot(Robot):
         if self._noise is not None:
             self._noise.prev = None
 
-    def motion_episode(self, *key):
+    def motion_episode(self, *key, clean=False):
         """Seed the coming episode's motion noise by `key` (e.g. scene id, episode number): the same
-        key repeats the same routes. Returns the trajectory master seed, None when the noise is off."""
+        key repeats the same routes; clean = no route perturbed. Returns the trajectory master seed,
+        None when the noise is off."""
         if self._noise is None:
             return None
-        self._noise.episode(*key)
+        self._noise.episode(*key, clean=clean)
         self._streaming = None
         return self._noise.master
 
