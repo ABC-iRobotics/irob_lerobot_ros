@@ -399,7 +399,7 @@ class ROS2Robot(Robot):
 
     def send_action(self, action: Pose | Twist | dict[str, float], cartesian=False, wait_for_execution=False,
                     speed: float | None = None, min_fraction: float = 0.0, perturb: bool = False,
-                    precise_end: bool = True, jitter=None) -> bool:
+                    precise_end: bool = True, jitter=None, aim: bool = False) -> bool:
         """speed: GUIDE-EX's speed, 0 to 1: MoveIt's velocity scaling (None keeps the current one), or
         controller: oscbf's cruise speed, speed x 0.5 m/s (None = 1.0). min_fraction: MoveIt's; a
         Cartesian path MoveIt can compute for less than this share of the way is refused before the
@@ -408,13 +408,14 @@ class ROS2Robot(Robot):
         With config.motion_noise (controller: oscbf, pose goals; ignored otherwise): perturb = an aim
         error around the planned path; precise_end=False = a free end, no settling: the call returns
         just before the end and the next pose move blends in; jitter = (x, y, z m, yaw rad), a uniform
-        random offset of the goal."""
+        random offset of the goal; aim (with precise_end=False) = a horizontal miss of the goal, whose
+        clean point stays on it, faded out by the next move."""
         if not self.is_connected:
             raise DeviceNotConnectedError("Robot is not connected.")
         if self.config.controller == "oscbf":
             try:
                 if self._noise is not None and isinstance(action, Pose):
-                    return self._send_noisy(action, wait_for_execution, speed, perturb, precise_end, jitter)
+                    return self._send_noisy(action, wait_for_execution, speed, perturb, precise_end, jitter, aim)
                 return self._send_oscbf(action, wait_for_execution, speed)
             except _oscbf_failures() as error:
                 self.node.get_logger().error(f"guide_motion planner refused the action: {type(error).__name__}: {error}")
@@ -779,7 +780,7 @@ class ROS2Robot(Robot):
         self._streaming = None
         return self._noise.master
 
-    def _send_noisy(self, action, wait_for_execution, speed, perturb, precise_end, jitter) -> bool:
+    def _send_noisy(self, action, wait_for_execution, speed, perturb, precise_end, jitter, aim=False) -> bool:
         """A pose move under config.motion_noise (send_action): the planner's Pink IK tracks the noise's
         route. A move after a free end takes the queue over at the blend point, planned from the target
         there, so the arm never stops; a free end returns HANDOVER_S of sim time before that point."""
@@ -815,7 +816,7 @@ class ROS2Robot(Robot):
                         v0 = np.linalg.norm(tail[k].position - planned[head + k - 1].position) / MOTION_DT
             self._streaming = None
         route = noise.route(rng, self._motion.ee_pose(q)[0], goal.position, speed * MAX_SPEED, perturb,
-                            free_end=not precise_end, handover=handover)
+                            free_end=not precise_end, handover=handover, aim=aim)
         targets = plan(self._motion, goal, q, speed=speed, route=route, v0=v0, stop=precise_end)
         with self._queue_lock:
             if handover is not None:
